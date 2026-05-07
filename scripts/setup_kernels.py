@@ -8,6 +8,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 
 # SPICE kernel definitions: (filename, URL)
 KERNELS = [

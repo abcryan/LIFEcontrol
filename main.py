@@ -26,10 +26,13 @@ Library rationale:
               cannot easily host SPICE calls inside its symbolic graph.
 """
 
+import sys
 import numpy as np
 import spiceypy as spice
 from scipy.integrate import solve_ivp
 from pathlib import Path
+
+sys.dont_write_bytecode = True
 
 # ── Kernels ───────────────────────────────────────────────────────────────────
 
@@ -91,7 +94,7 @@ def load_kernels() -> None:
 
 # ── Dynamics ──────────────────────────────────────────────────────────────────
 
-def grav_accel(r: np.ndarray, et: float) -> np.ndarray:
+def a_grav(r: np.ndarray, et: float) -> np.ndarray:
     """
     N-body gravitational acceleration [km/s²] at ICRF position r [km].
 
@@ -108,8 +111,14 @@ def grav_accel(r: np.ndarray, et: float) -> np.ndarray:
 
 
 def _ode(t: float, x: np.ndarray, et0: float) -> np.ndarray:
-    """ODE right-hand side:  ẋ = [v;  a_grav(r, et0 + t)]."""
-    return np.concatenate([x[3:], grav_accel(x[:3], et0 + t)])
+    """ODE right-hand side: dot x = [v; a_grav(r, et0 + t)]."""
+    
+    v = x[3:]
+    a = a_grav(x[:3], et0 + t)
+    return np.concatenate([
+        v,
+        a,
+    ])
 
 # ── Propagator ────────────────────────────────────────────────────────────────
 

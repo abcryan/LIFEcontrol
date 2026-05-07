@@ -9,7 +9,7 @@ When you first clone this repository, follow these steps to get everything worki
 ### 1. Download SPICE kernels
 
 ```bash
-python scripts/setup_kernels.py
+python3 scripts/setup_kernels.py
 # or: ./scripts/setup_kernels.py
 ```
 
@@ -22,6 +22,7 @@ This downloads the three required SPICE kernels (~114 MB total) to `data/spice_k
 
 ```bash
 pip install numpy spiceypy scipy
+# or: use your preferred package manager (e.g. conda) to install numpy, spiceypy, and scipy
 ```
 
 **Note:** Without these packages, `python main.py` will fail with import errors.
@@ -31,80 +32,17 @@ pip install numpy spiceypy scipy
 Check that everything is properly configured:
 
 ```bash
-python scripts/check_setup.py
+python3 scripts/check_setup.py
 # or: ./scripts/check_setup.py
 ```
 
 ### 4. Run the mission propagator
 
 ```bash
-python main.py
+python3 main.py
 ```
 
 This loads the kernels and demonstrates a 1-day trajectory propagation from the Sun–Earth L2.
-
----
-
-## Quick Start
-
-### 1. Download SPICE kernels
-
-Run the downloader directly from the repository root:
-
-```bash
-python setup_kernels.py
-```
-
-This automatically downloads the three required SPICE kernels to `data/spice_kernels/`:
-- **naif0012.tls** (leapseconds)
-- **de440.bsp** (planetary ephemeris, ~114 MB)
-- **gm_de440.tpc** (GM values matched to DE440)
-
-The script will skip any kernels already present and show progress for large downloads.
-
-### 2. Install runtime dependencies (optional)
-
-If you want to run the mission propagator (`main.py`), install the required scientific packages:
-
-```bash
-pip install numpy spiceypy scipy
-```
-
-### 3. Run the mission propagator
-
-```bash
-python main.py
-```
-
-This loads the kernels and demonstrates a 1-day trajectory propagation from the Sun–Earth L2.
-
----
-
-## What Gets Downloaded/Created
-
-After running the setup steps:
-
-- **`data/spice_kernels/`** directory is created with:
-  - `naif0012.tls` (~1 KB) - leapseconds kernel
-  - `de440.bsp` (~114 MB) - planetary ephemeris
-  - `gm_de440.tpc` (~1 KB) - gravitational parameters
-
-- **Python packages** installed (if step 2 is run):
-  - `numpy` - numerical arrays
-  - `spiceypy` - SPICE toolkit interface
-  - `scipy` - ODE integration
-
----
-
-## What This Automation Does
-
-The repository automates the SPICE kernel download step:
-
-- `scripts/setup_kernels.py` downloads required kernels from NAIF servers
-- `scripts/check_setup.py` verifies that setup is complete
-- No Python package install is required for kernel download
-- Runtime dependencies (`numpy`, `spiceypy`, `scipy`) must be installed separately
-- Users may install `numpy`, `spiceypy`, and `scipy` themselves if they want to run `main.py`.
 
 ---
 
@@ -142,10 +80,3 @@ LIFEcontrol/
 
 ## Development
 
-This repository does not require a package install for kernel download.
-
-Use the downloader script directly:
-
-```bash
-python setup_kernels.py
-```

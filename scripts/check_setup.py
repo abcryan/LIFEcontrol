@@ -8,6 +8,7 @@ This script verifies that all required components are properly set up.
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 
 def check_kernels() -> bool:
     """Check if SPICE kernels are present."""
