@@ -25,7 +25,6 @@ Library rationale:
   CasADi    – reserved for MPC controller (symbolic differentiation, NLP);
               cannot easily host SPICE calls inside its symbolic graph.
 """
-
 import sys
 import numpy as np
 import spiceypy as spice
@@ -110,13 +109,14 @@ def a_grav(r: np.ndarray, et: float) -> np.ndarray:
     return a
 
 
-def _ode(t: float, x: np.ndarray, et0: float) -> np.ndarray:
-    """ODE right-hand side: dot x = [v; a_grav(r, et0 + t)]."""
-    
+def x_dot(t: float, x: np.ndarray, et0: float, u: np.ndarray) -> np.ndarray:
+    """ODE right-hand side: dot x = [v; 
+                                     a_grav(r, et0 + t) + a_ctrl  ]."""
+    a_ctrl = u  # control acceleration [km/s²]
     v = x[3:]
-    a = a_grav(x[:3], et0 + t)
+    a = a_grav(x[:3], et0 + t) + a_ctrl
     return np.concatenate([
-        v,
+        v, 
         a,
     ])
 
@@ -127,6 +127,7 @@ def propagate(
     v0:     np.ndarray,
     t_span: tuple[float, float],
     et0:    float,
+    u:      np.ndarray | None = None,
     t_eval: np.ndarray | None = None,
     rtol:   float = 1e-12,
     atol:   float = 1e-12,
@@ -135,20 +136,20 @@ def propagate(
     Propagate spacecraft from (r0 [km], v0 [km/s]) over t_span [s].
 
     et0     : start epoch as SPICE ET (seconds past J2000 TDB).
+    u       : constant control acceleration [km/s²] (default: zeros).
     t_eval  : optional output times within t_span; if None, uses adaptive steps.
     rtol/atol: integrator tolerances (defaults give sub-μm accuracy).
 
-    Integrator: DOP853 (8th-order Runge-Kutta, Dormand-Prince).
-    Results are exactly reproducible given identical rtol/atol and SPICE kernels.
-
     Returns {'t': (N,), 'r': (N,3) km, 'v': (N,3) km/s}.
     """
+    if u is None:
+        u = np.zeros(3)
     sol = solve_ivp(
-        _ode, t_span,
+        x_dot, t_span,
         np.concatenate([r0, v0]),
         method       = "DOP853",
         t_eval       = t_eval,
-        args         = (et0,),
+        args         = (et0, u),
         rtol         = rtol,
         atol         = atol,
         dense_output = False,
@@ -159,18 +160,36 @@ def propagate(
 
 
 def step(
-    r: np.ndarray, v: np.ndarray, dt: float, et: float
+    r:    np.ndarray,
+    v:    np.ndarray,
+    dt:   float,
+    et:   float,
+    u:    np.ndarray | None = None,
+    rtol: float = 1e-12,
+    atol: float = 1e-12,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Advance state one control sample of dt [s] from epoch et.
 
-    Discrete-time interface for the control loop: propagates the continuous ODE
-    over [0, dt] with current state and returns (r_next, v_next).
-    Control forces (u) are not yet included – they will be added to _ode once
-    the controller is implemented (zero-order hold over the sample period).
+    u       : control acceleration [km/s²], zero-order hold over dt (default: zeros).
+    rtol/atol: integrator tolerances (defaults give sub-μm accuracy).
+
+    Returns (r_next [km], v_next [km/s]).
     """
-    res = propagate(r, v, (0.0, dt), et)
-    return res["r"][-1], res["v"][-1]
+    if u is None:
+        u = np.zeros(3)
+    sol = solve_ivp(
+        x_dot, (0.0, dt),
+        np.concatenate([r, v]),
+        method       = "DOP853",
+        args         = (et, u),
+        rtol         = rtol,
+        atol         = atol,
+        dense_output = False,
+    )
+    if not sol.success:
+        raise RuntimeError(f"Integration failed: {sol.message}")
+    return sol.y[:3, -1], sol.y[3:, -1]
 
 # ── Demo ──────────────────────────────────────────────────────────────────────
 
@@ -196,15 +215,17 @@ if __name__ == "__main__":
     print(f"r0     : {r0}  km")
     print(f"v0     : {v0}  km/s")
 
-    # Full trajectory: 1 day at 60 s output cadence
-    t_eval  = np.arange(0.0, 86401.0, 60.0)
-    result  = propagate(r0, v0, (0.0, t_eval[-1]), et0, t_eval=t_eval)
+    u = np.zeros(3)   # control acceleration [km/s²] – zero thrust
 
-    dr = np.linalg.norm(result["r"][-1] - result["r"][0])
-    print(f"\nPropagated {len(result['t'])} samples over 1 day")
-    print(f"r(tf)  : {result['r'][-1]}  km")
-    print(f"|Δr|   : {dr:.3f} km")
+    # # Full trajectory: 1 day at 60 s output cadence
+    # t_eval = np.arange(0.0, 86401.0, 60.0)
+    # result = propagate(r0, v0, (0.0, t_eval[-1]), et0, u=u, t_eval=t_eval)
+
+    # dr = np.linalg.norm(result["r"][-1] - result["r"][0])
+    # print(f"\nPropagated {len(result['t'])} samples over 1 day")
+    # print(f"r(tf)  : {result['r'][-1]}  km")
+    # print(f"|Δr|   : {dr:.3f} km")
 
     # Single control step (example: 1 s sample period)
-    r_next, v_next = step(r0, v0, dt=1.0, et=et0)
+    r_next, v_next = step(r0, v0, dt=1.0, et=et0, u=u)
     print(f"\n1 s step  Δr = {np.linalg.norm(r_next - r0)*1e6:.3f} mm")
