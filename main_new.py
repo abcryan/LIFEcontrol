@@ -452,6 +452,377 @@ def plot_trajectory(
     plt.show()
 
 
+
+# ── Sun-Earth L2 / rotating-frame helper functions ───────────────────────────
+
+L2_DIST_KM = 1.5e6
+
+
+def sun_earth_l2_frame(
+    et: float,
+    l2_dist_km: float = L2_DIST_KM,
+) -> dict[str, np.ndarray]:
+    """
+    Build an instantaneous Sun-Earth rotating-frame triad at epoch et.
+
+    e_x : from Sun toward Earth, pointing outward past Earth toward L2
+    e_z : normal to the instantaneous Sun-Earth orbital plane
+    e_y : completes right-handed frame, approximately Earth's prograde direction
+
+    Returns:
+        r_l2      : approximate Sun-Earth L2 position in ICRF [km]
+        v_l2      : inertial velocity of the co-rotating L2 point [km/s]
+        e_x,e_y,e_z
+        omega_vec : instantaneous Sun-Earth angular velocity vector [rad/s]
+    """
+    state_earth = spice.spkezr("EARTH", et, "J2000", "NONE", "SSB")[0]
+    state_sun   = spice.spkezr("SUN",   et, "J2000", "NONE", "SSB")[0]
+
+    r_earth = state_earth[:3]
+    v_earth = state_earth[3:]
+
+    r_sun = state_sun[:3]
+    v_sun = state_sun[3:]
+
+    r_es = r_earth - r_sun
+    v_es = v_earth - v_sun
+
+    e_x = r_es / np.linalg.norm(r_es)
+
+    h_es = np.cross(r_es, v_es)
+    e_z = h_es / np.linalg.norm(h_es)
+
+    e_y = np.cross(e_z, e_x)
+    e_y = e_y / np.linalg.norm(e_y)
+
+    # Instantaneous angular velocity of the Sun-Earth line.
+    omega_vec = h_es / np.dot(r_es, r_es)
+
+    r_l2 = r_earth + l2_dist_km * e_x
+
+    # Co-rotating inertial velocity of the approximate L2 point.
+    # This is the important correction compared with simply using Earth's velocity.
+    v_l2 = v_sun + np.cross(omega_vec, r_l2 - r_sun)
+
+    return {
+        "r_l2": r_l2,
+        "v_l2": v_l2,
+        "e_x": e_x,
+        "e_y": e_y,
+        "e_z": e_z,
+        "omega_vec": omega_vec,
+    }
+
+
+# ── Solar-system beauty plot ─────────────────────────────────────────────────
+
+# Body colors and (relative) display radii. Display radii are NOT physical —
+# physical radii (Sun ~7e5 km, Mercury ~2440 km) are invisible at a scale that
+# includes Mercury's orbit, so dots are drawn at exaggerated sizes for visibility.
+# Orbital positions remain exactly to scale via SPICE.
+_BODY_STYLE = {
+    "SUN":     dict(color="#FFD24A", marker_size=260, trail_color="#FFB000", label="Sun"),
+    "MERCURY": dict(color="#A9A9A9", marker_size=28,  trail_color="#888888", label="Mercury"),
+    "VENUS":   dict(color="#E8B16D", marker_size=45,  trail_color="#C0824A", label="Venus"),
+    "EARTH":   dict(color="#3A8DDE", marker_size=48,  trail_color="#1F5FA8", label="Earth"),
+    "MOON":    dict(color="#D9D9D9", marker_size=20,  trail_color="#A0A0A0", label="Moon"),
+}
+
+
+def plot_solar_system(
+    et0:       float,
+    duration:  float,
+    spacecraft_r:    np.ndarray | None = None,
+    spacecraft_t:    np.ndarray | None = None,
+    n_trail_samples: int = 200,
+    n_stars:         int = 800,
+) -> None:
+    """
+    Render the inner solar system in a dark, slightly-tilted 3D view.
+
+    Bodies drawn: Sun, Mercury, Venus, Earth, Moon (and the spacecraft if
+    provided). Distances are exactly to scale; body marker sizes are
+    exaggerated so the smaller bodies are visible alongside the Sun.
+
+    Args:
+        et0          : initial SPICE ET [s past J2000 TDB]
+        duration     : window length [s] (typically same as the sim)
+        spacecraft_r : optional spacecraft position history (N, 3) in ICRF [km]
+        spacecraft_t : optional spacecraft time vector (N,) in seconds since et0
+        n_trail_samples : how many SPICE samples to draw each body's trail with
+        n_stars      : number of background stars
+    """
+    # --- Sample body positions along the window ---------------------------
+    t_samples = np.linspace(0.0, duration, n_trail_samples)
+    body_keys = ("SUN", "MERCURY", "VENUS", "EARTH", "MOON")
+
+    trails: dict[str, np.ndarray] = {}
+    for body in body_keys:
+        # SPICE name lookup: planets stored as "X BARYCENTER" or directly.
+        spice_name = body if body in ("SUN", "EARTH", "MOON") else f"{body} BARYCENTER"
+        trail = np.array([
+            spice.spkezr(spice_name, et0 + tk, "J2000", "NONE", "SSB")[0][:3]
+            for tk in t_samples
+        ])
+        trails[body] = trail
+
+    # --- Figure & dark style ---------------------------------------------
+    fig = plt.figure(figsize=(14, 10), facecolor="black", dpi=150)
+    ax  = fig.add_subplot(111, projection="3d")
+    ax.set_facecolor("black")
+
+    # Hide panes & axes for a clean space look.
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.pane.fill = False
+        axis.pane.set_edgecolor((0, 0, 0, 0))
+        axis.line.set_color((1, 1, 1, 0.15))
+        axis.label.set_color("white")
+        for tick in axis.get_ticklabels():
+            tick.set_color((1, 1, 1, 0.4))
+    ax.grid(False)
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+
+    # --- Background stars (random, in a large sphere around the view) ----
+    rng = np.random.default_rng(seed=42)
+    # Place stars on a large bounding sphere ~3x the outermost orbit.
+    R_view = max(np.linalg.norm(trails["VENUS"][0]), 1.5e8) * 3.0
+    phi   = rng.uniform(0.0, 2.0 * np.pi, n_stars)
+    costh = rng.uniform(-1.0, 1.0, n_stars)
+    sinth = np.sqrt(1.0 - costh ** 2)
+    sx = R_view * sinth * np.cos(phi)
+    sy = R_view * sinth * np.sin(phi)
+    sz = R_view * costh
+    star_brightness = rng.uniform(0.3, 1.0, n_stars)
+    star_size       = rng.uniform(0.3, 2.0, n_stars)
+    ax.scatter(sx, sy, sz,
+               c=[(b, b, b) for b in star_brightness],
+               s=star_size, marker=".", depthshade=False)
+
+    # --- Body trails and current positions -------------------------------
+    for body in body_keys:
+        style = _BODY_STYLE[body]
+        trail = trails[body]
+        # Trail (faint, behind the body).
+        ax.plot(trail[:, 0], trail[:, 1], trail[:, 2],
+                color=style["trail_color"], lw=1.0, alpha=0.55)
+        # Body at final epoch position.
+        # Previously this used trail[0], while the spacecraft marker used spacecraft_r[-1].
+        # That made the solar-system view visually inconsistent.
+        ax.scatter(
+            [trail[-1, 0]], [trail[-1, 1]], [trail[-1, 2]],
+            s=style["marker_size"], color=style["color"],
+            edgecolors="white", linewidths=0.6,
+            label=style["label"], depthshade=False, zorder=10,
+        )
+
+        # Optional faint start marker.
+        ax.scatter(
+            [trail[0, 0]], [trail[0, 1]], [trail[0, 2]],
+            s=0.35 * style["marker_size"], color=style["color"],
+            edgecolors="none", alpha=0.35,
+            depthshade=False, zorder=8,
+        )
+
+    # Sun glow: stack of fading concentric markers.
+    sun_pos = trails["SUN"][-1]
+    for r_scale, alpha in [(2.0, 0.25), (3.5, 0.12), (6.0, 0.05)]:
+        ax.scatter(
+            [sun_pos[0]], [sun_pos[1]], [sun_pos[2]],
+            s=_BODY_STYLE["SUN"]["marker_size"] * r_scale,
+            color="#FFD24A", alpha=alpha, edgecolors="none",
+            depthshade=False, zorder=9,
+        )
+
+    # --- Spacecraft (optional) -------------------------------------------
+    if spacecraft_r is not None:
+        ax.plot(
+            spacecraft_r[:, 0], spacecraft_r[:, 1], spacecraft_r[:, 2],
+            color="#FF4D6D", lw=1.4, alpha=0.9, label="spacecraft"
+        )
+
+        # Start marker.
+        ax.scatter(
+            [spacecraft_r[0, 0]], [spacecraft_r[0, 1]], [spacecraft_r[0, 2]],
+            s=22, color="#FF4D6D", edgecolors="white", linewidths=0.4,
+            depthshade=False, zorder=11,
+        )
+
+        # End marker.
+        ax.scatter(
+            [spacecraft_r[-1, 0]], [spacecraft_r[-1, 1]], [spacecraft_r[-1, 2]],
+            s=35, color="#FF4D6D", edgecolors="white", linewidths=0.5,
+            depthshade=False, zorder=12,
+        )
+
+        # A few small direction markers along the trajectory.
+        n_arrows = 8
+        idxs = np.linspace(0, len(spacecraft_r) - 1, n_arrows + 2, dtype=int)[1:-1]
+        ax.scatter(
+            spacecraft_r[idxs, 0], spacecraft_r[idxs, 1], spacecraft_r[idxs, 2],
+            s=10, color="#FF8FA3", edgecolors="none",
+            depthshade=False, zorder=12,
+        )
+
+    # --- Camera & framing -------------------------------------------------
+    # Frame to Venus' orbit (outer of the inner bodies of interest).
+    R_frame = np.linalg.norm(trails["VENUS"][0]) * 1.25
+    ax.set_xlim(-R_frame, R_frame)
+    ax.set_ylim(-R_frame, R_frame)
+    ax.set_zlim(-R_frame * 0.6, R_frame * 0.6)
+    ax.set_box_aspect((1, 1, 0.6))                # keep z compressed for the tilt
+    ax.view_init(elev=15.0, azim=-60.0)            # slight tilt above ecliptic
+
+    # --- Title & legend ---------------------------------------------------
+    ax.set_title(
+        f"Inner Solar System — {spice.et2utc(et0, 'ISOC', 0)}  "
+        f"(+{duration/86400:.2f} d)",
+        color="white", fontsize=13, pad=15,
+    )
+    leg = ax.legend(
+        loc="upper left", fontsize=9, frameon=True,
+        facecolor=(0, 0, 0, 0.6), edgecolor=(1, 1, 1, 0.2),
+        labelcolor="white",
+    )
+    for txt in leg.get_texts():
+        txt.set_color("white")
+
+    fig.tight_layout()
+    plt.show()
+
+def plot_l2_rotating_frame_zoom(
+    et0: float,
+    t_hist: np.ndarray,
+    spacecraft_r: np.ndarray,
+    l2_dist_km: float = L2_DIST_KM,
+) -> None:
+    """
+    Plot spacecraft, Earth, and Moon in a Sun-Earth L2 rotating frame.
+
+    Coordinates:
+        origin : instantaneous approximate L2 point
+        x      : Sun -> Earth -> L2 direction
+        y      : prograde direction
+        z      : ecliptic-normal direction
+
+    This is the correct diagnostic plot for checking whether the spacecraft
+    is behaving like an L2 halo/Lissajous trajectory.
+    """
+    sc_rel = np.zeros_like(spacecraft_r)
+    earth_rel = np.zeros_like(spacecraft_r)
+    moon_rel = np.zeros_like(spacecraft_r)
+
+    for k, tk in enumerate(t_hist):
+        et = et0 + tk
+
+        frame = sun_earth_l2_frame(et, l2_dist_km=l2_dist_km)
+
+        r_l2 = frame["r_l2"]
+        e_x = frame["e_x"]
+        e_y = frame["e_y"]
+        e_z = frame["e_z"]
+
+        basis = np.vstack([e_x, e_y, e_z])
+
+        r_earth = spice.spkezr("EARTH", et, "J2000", "NONE", "SSB")[0][:3]
+        r_moon  = spice.spkezr("MOON",  et, "J2000", "NONE", "SSB")[0][:3]
+
+        sc_rel[k, :] = basis @ (spacecraft_r[k, :] - r_l2)
+        earth_rel[k, :] = basis @ (r_earth - r_l2)
+        moon_rel[k, :] = basis @ (r_moon - r_l2)
+
+    fig = plt.figure(figsize=(10, 8), facecolor="black", dpi=150)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_facecolor("black")
+
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.pane.fill = False
+        axis.pane.set_edgecolor((0, 0, 0, 0))
+        axis.line.set_color((1, 1, 1, 0.2))
+        axis.label.set_color("white")
+        for tick in axis.get_ticklabels():
+            tick.set_color((1, 1, 1, 0.65))
+
+    ax.grid(True, alpha=0.15)
+
+    # L2 point.
+    ax.scatter(
+        [0], [0], [0],
+        s=55, color="#FFFFFF", edgecolors="#000000",
+        linewidths=0.5, label="approx. L2", depthshade=False,
+    )
+
+    # Earth and Moon relative to L2.
+    ax.plot(
+        earth_rel[:, 0], earth_rel[:, 1], earth_rel[:, 2],
+        color="#3A8DDE", lw=1.2, alpha=0.7, label="Earth"
+    )
+    ax.scatter(
+        [earth_rel[-1, 0]], [earth_rel[-1, 1]], [earth_rel[-1, 2]],
+        s=65, color="#3A8DDE", edgecolors="white",
+        linewidths=0.5, depthshade=False,
+    )
+
+    ax.plot(
+        moon_rel[:, 0], moon_rel[:, 1], moon_rel[:, 2],
+        color="#D9D9D9", lw=0.9, alpha=0.85, label="Moon"
+    )
+    ax.scatter(
+        [moon_rel[-1, 0]], [moon_rel[-1, 1]], [moon_rel[-1, 2]],
+        s=28, color="#D9D9D9", edgecolors="white",
+        linewidths=0.4, depthshade=False,
+    )
+
+    # Spacecraft relative trajectory.
+    ax.plot(
+        sc_rel[:, 0], sc_rel[:, 1], sc_rel[:, 2],
+        color="#FF4D6D", lw=1.6, alpha=0.95, label="spacecraft"
+    )
+    ax.scatter(
+        [sc_rel[0, 0]], [sc_rel[0, 1]], [sc_rel[0, 2]],
+        s=30, color="#FF4D6D", edgecolors="white",
+        linewidths=0.4, depthshade=False,
+    )
+    ax.scatter(
+        [sc_rel[-1, 0]], [sc_rel[-1, 1]], [sc_rel[-1, 2]],
+        s=45, color="#FF4D6D", edgecolors="white",
+        linewidths=0.5, depthshade=False,
+    )
+
+    ax.set_xlabel("x from L2 [km]")
+    ax.set_ylabel("y from L2 [km]")
+    ax.set_zlabel("z from L2 [km]")
+
+    ax.set_title(
+        "Sun-Earth L2 Rotating-Frame Zoom",
+        color="white", fontsize=13, pad=12,
+    )
+
+    # Symmetric-ish box around spacecraft, Earth, Moon, and L2.
+    pts = np.vstack([sc_rel, earth_rel, moon_rel, np.zeros((1, 3))])
+    pmin = pts.min(axis=0)
+    pmax = pts.max(axis=0)
+    ctr = 0.5 * (pmin + pmax)
+    half = 0.60 * max(pmax - pmin)
+
+    ax.set_xlim(ctr[0] - half, ctr[0] + half)
+    ax.set_ylim(ctr[1] - half, ctr[1] + half)
+    ax.set_zlim(ctr[2] - half, ctr[2] + half)
+    ax.set_box_aspect((1, 1, 1))
+
+    ax.view_init(elev=22.0, azim=-55.0)
+
+    leg = ax.legend(
+        loc="upper left", fontsize=9, frameon=True,
+        facecolor=(0, 0, 0, 0.6), edgecolor=(1, 1, 1, 0.2),
+        labelcolor="white",
+    )
+    for txt in leg.get_texts():
+        txt.set_color("white")
+
+    fig.tight_layout()
+    plt.show()
+
+
 # ── Demo: epoch-stepping main loop ───────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -462,16 +833,12 @@ if __name__ == "__main__":
         print(f"  {body:<20s} {mu: .10e}")
 
     # --- Initial epoch ----------------------------------------------------
-    et0 = spice.str2et("2027-01-01T00:00:00")
+    et0 = spice.str2et("2026-05-12T00:00:00")
 
     # --- Initial spacecraft state -----------------------------------------
-    # Position: approximate Sun-Earth L2 (Earth + 1.5e6 km along Sun-Earth line)
-    r_earth = spice.spkezr("EARTH", et0, "J2000", "NONE", "SSB")[0]
-    r_sun   = spice.spkezr("SUN",   et0, "J2000", "NONE", "SSB")[0]
-    earth_hat = (r_earth[:3] - r_sun[:3]) / np.linalg.norm(r_earth[:3] - r_sun[:3])
-
-    r0 = r_earth[:3] + 1.5e6 * earth_hat          # [km]
-    v0 = r_earth[3:].copy()                       # [km/s]  (inherit Earth's velocity)
+    # Approximate Sun-Earth L2 halo-like initial condition from JWST: https://ssd.jpl.nasa.gov/horizons/app.html#/
+    r0 = np.array([-9.594503991242750e7, -1.098032827423822e8,-4.778858640538428e7 ])
+    v0 = np.array([2.279303677102495e1, -1.735582913273474e1, -7.640659579588683e0])
     q0 = np.array([1.0, 0.0, 0.0, 0.0])           # identity quaternion (scalar-first)
     w0 = np.array([0.01, 0.0, 0.0])               # [rad/s]  small body-x spin
     m0 = 500.0                                    # [kg]
@@ -486,10 +853,10 @@ if __name__ == "__main__":
     print(f"m0     : {x[13]}  kg")
 
     # --- Main control loop -----------------------------------------------
-    # 1 day at 20 s sampling -> 4320 samples. With omega ~ 0.01 rad/s the spin
+    # 1 day at 2 s sampling -> 43200 samples. With omega ~ 0.01 rad/s the spin
     # period is ~628 s, so we get ~300 samples per period -> smooth curves.
-    dt        = 20.0
-    n_steps   = int(86400 / dt)
+    dt        = 2000.0
+    n_steps   = int(100*86400 / dt)
     et        = et0
 
     # History buffers, including the initial sample.
@@ -531,3 +898,14 @@ if __name__ == "__main__":
     # --- Plot ------------------------------------------------------------
     print("\nGenerating plots ...")
     plot_trajectory(t_hist, X_hist, et0)
+    plot_solar_system(
+        et0          = et0,
+        duration     = t_hist[-1],
+        spacecraft_r = X_hist[:, 0:3],
+        spacecraft_t = t_hist,
+    )
+    plot_l2_rotating_frame_zoom(
+        et0          = et0,
+        t_hist       = t_hist,
+        spacecraft_r = X_hist[:, 0:3],
+    )
