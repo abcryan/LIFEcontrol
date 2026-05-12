@@ -8,10 +8,10 @@ def Quat_to_CTM(q: np.ndarray) -> np.ndarray:
     Multisensor Integrated Navigation Systems," 2nd ed.
 
     Args:
-        q : (4,) quaternion [q0, q1, q2, q3] (scalar-first, alpha -> beta)
+        q^beta_alpha : (4,) quaternion [q0, q1, q2, q3] (scalar-first, alpha -> beta)
 
     Returns:
-        C: 3x3 coordinate transformation matrix (alpha -> beta)
+        C^beta_alpha: 3x3 coordinate transformation matrix (alpha -> beta)
     """
 
     # Ensure input is a 4-element array of floats

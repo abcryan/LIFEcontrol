@@ -26,12 +26,15 @@ Library rationale:
               cannot easily host SPICE calls inside its symbolic graph.
 """
 import sys
+sys.dont_write_bytecode = True
 import numpy as np
 import spiceypy as spice
 from scipy.integrate import solve_ivp
 from pathlib import Path
 
-sys.dont_write_bytecode = True
+
+# Import functions
+from utils.other.Omega_omega import Omega_omega
 
 # ── Kernels ───────────────────────────────────────────────────────────────────
 
@@ -91,7 +94,19 @@ def load_kernels() -> None:
     for body in BODIES:
         GM[body] = float(spice.bodvrd(body, "GM", 1)[1][0])
 
+# ── Kinematics ────────────────────────────────────────────────────────────────
+
+def quat_kinematics(q: np.ndarray, omega: np.ndarray) -> np.ndarray:
+    """Compute quaternion derivative q_dot = 0.5 * Omega(omega) * q."""
+
+    Omega = Omega_omega(omega)
+    q_dot = 0.5 * Omega @ q
+
+    return q_dot
+
+
 # ── Dynamics ──────────────────────────────────────────────────────────────────
+
 
 def a_grav(r: np.ndarray, et: float) -> np.ndarray:
     """
@@ -109,15 +124,49 @@ def a_grav(r: np.ndarray, et: float) -> np.ndarray:
     return a
 
 
-def x_dot(t: float, x: np.ndarray, et0: float, u: np.ndarray) -> np.ndarray:
-    """ODE right-hand side: dot x = [v; 
-                                     a_grav(r, et0 + t) + a_ctrl  ]."""
-    a_ctrl = u  # control acceleration [km/s²]
-    v = x[3:]
-    a = a_grav(x[:3], et0 + t) + a_ctrl
+def x_dot_i(t: float, x: np.ndarray, et0: float, u: np.ndarray) -> np.ndarray:
+    """ODE right-hand side for coupled translational + rotational dynamics.
+    
+    State vector x_i = [r (3), v (3), q (4), omega (3)]  -> shape (13,)
+        r     : position [km]
+        v     : velocity [km/s]
+        q     : attitude quaternion (body wrt inertial)
+        omega : angular velocity of body wrt inertial, in body frame [rad/s]
+    
+    Control vector u = [a_ctrl (3), tau_ctrl (3)]  -> shape (6,)
+        a_ctrl   : control acceleration   [km/s²]
+        tau_ctrl : control torque (body)  [N·m]
+    
+    Returns dot x_i = [v; a; q_dot; omega_dot].
+    """
+    # --- Unpack state ---
+    r     = x[0:3]
+    v     = x[3:6]
+    # q     = x[6:10]
+    # omega = x[10:13]
+    
+    # --- Unpack control ---
+    a_ctrl   = u[0:3]   # control acceleration [km/s²]
+    # tau_ctrl = u[3:6]   # control torque       [N·m]
+    
+    # --- Translational dynamics ---
+    # dot r = v
+    # dot v = a_grav(r, t) + a_ctrl
+    r_dot = v
+    v_dot = a_grav(r, et0 + t) + a_ctrl
+    
+    # --- Attitude kinematics (quaternion) ---
+    # dot q = 0.5 * Omega(omega) * q     (or equivalently 0.5 * q ⊗ omega_quat)
+    # q_dot = quat_kinematics(q, omega)
+    
+    # --- Rotational dynamics (Euler's equation, no disturbances) ---
+    # I * dot omega + omega x (I * omega) + I_dot * omega = tau_ctrl
+    # =>  dot omega = I^{-1} ( tau_ctrl - omega x (I * omega) - I_dot * omega )
+    # omega_dot = J_inv @ (tau_ctrl - np.cross(omega, J @ omega) - J_dot @ omega)
+    
     return np.concatenate([
-        v, 
-        a,
+        r_dot,
+        v_dot,
     ])
 
 # ── Propagator ────────────────────────────────────────────────────────────────
@@ -145,7 +194,7 @@ def propagate(
     if u is None:
         u = np.zeros(3)
     sol = solve_ivp(
-        x_dot, t_span,
+        x_dot_i, t_span,
         np.concatenate([r0, v0]),
         method       = "DOP853",
         t_eval       = t_eval,
@@ -179,7 +228,7 @@ def step(
     if u is None:
         u = np.zeros(3)
     sol = solve_ivp(
-        x_dot, (0.0, dt),
+        x_dot_i, (0.0, dt),
         np.concatenate([r, v]),
         method       = "DOP853",
         args         = (et, u),

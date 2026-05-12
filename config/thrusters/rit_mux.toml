@@ -1,0 +1,57 @@
+# ArianeGroup RIT-μX thruster specification
+# Source: ArianeGroup official datasheet (2021), IEPC-2017-27, IEPC-2019
+# url: https://satsearch.co/products/airbus-defence-and-space-rit-u-x
+# Last updated: 2026-05-12
+
+[meta]
+name = "ArianeGroup RIT-μX"
+manufacturer = "ArianeGroup"
+propellant = "Xenon"
+heritage = "RIT-10 (EURECA 1992, Artemis 2001-2017)"
+
+# Active operating mode for this run
+# Options: "fine", "nominal", "coarse"
+[mode]
+active = "nominal"
+
+# Thrust [N], Isp [s], Power [W] per operating point
+[operating_points.fine]
+F_min       = 10e-6
+F_max       = 100e-6
+Isp         = 1000.0
+power       = 15.0
+
+[operating_points.nominal]
+F_min       = 50e-6
+F_max       = 500e-6
+Isp         = 2500.0
+power       = 50.0
+
+[operating_points.coarse]
+F_min       = 300e-6
+F_max       = 3000e-6
+Isp         = 3000.0
+power       = 150.0
+
+[performance]
+F_resolution    = 0.1e-6     # N, minimum commandable thrust step
+F_noise_psd     = 0.1e-6     # N/sqrt(Hz), thrust noise PSD floor
+response_time   = 0.010      # s, thrust rise time
+beam_half_angle = 0.2967     # rad (17 deg, 95% half-angle)
+
+[mass_geometry]
+mass_thruster      = 0.44    # kg, thruster only
+mass_chain_total   = 2.5     # kg, incl. RFG, neutralizer, PPU share
+diameter           = 0.078   # m
+height             = 0.076   # m
+
+[lifetime]
+total_impulse_max  = 200_000.0   # N·s
+operating_hours    = 20_000.0    # h
+operating_cycles   = 10_000
+
+[environment]
+T_op_min_C    = -40
+T_op_max_C    = 160
+T_nonop_min_C = -60
+T_nonop_max_C = 160
