@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def Quat_to_CTM(q: np.ndarray) -> np.ndarray:
+def quat_to_CTM(q: np.ndarray) -> np.ndarray:
     """Convert Groves attitude quaternion q_alpha^beta to CTM C_alpha^beta.
 
     Implements eq. (2.34) from Groves, "Principles of GNSS, Inertial, and

@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def CTM_to_Quat(C: np.ndarray) -> np.ndarray:
+def CTM_to_quat(C: np.ndarray) -> np.ndarray:
     """Convert a coordinate transformation matrix to a quaternion.
 
     Converts a CTM describing the transformation from frame alpha to frame

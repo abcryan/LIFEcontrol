@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def CTM_to_Euler(C: np.ndarray) -> np.ndarray:
+def CTM_to_euler(C: np.ndarray) -> np.ndarray:
     """Convert a coordinate transformation matrix to Euler angles.
 
     Converts a CTM describing the transformation from frame beta to frame
