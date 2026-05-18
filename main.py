@@ -43,18 +43,13 @@ from utils.plotting.plotting import (
 )
 
 
-# ── SPICE kernels ─────────────────────────────────────────────────────────────
+# ── SPICE defaults ───────────────────────────────────────────────────────────
 
 KERNELS = [
     "data/spice_kernels/naif0012.tls",
     "data/spice_kernels/de440.bsp",
     "data/spice_kernels/gm_de440.tpc",
 ]
-
-
-def _check_kernels_exist() -> bool:
-    return all(Path(k).exists() for k in KERNELS)
-
 
 # ── Gravitational parameters [km^3/s^2] ──────────────────────────────────────
 
@@ -71,28 +66,69 @@ BODIES: tuple[str, ...] = (
     "NEPTUNE BARYCENTER",
 )
 
-GM: dict[str, float] = {}   # populated by load_kernels()
 
+# ── SpiceEnv: kernels, GM, and ephemeris lookups ─────────────────────────────
 
-def load_kernels() -> None:
-    """Furnish SPICE kernels and read GM values from the PCK."""
-    if not _check_kernels_exist():
-        raise FileNotFoundError(
-            "\n" + "=" * 70 + "\n"
-            "SPICE kernels not found!\n\n"
-            "Required kernels are missing from data/spice_kernels/\n"
-            "Download them automatically using:\n\n"
-            "  pip install -e .\n"
-            "  lifecontrol-setup-kernels\n\n"
-            "Or manually from NAIF:\n"
-            "  https://naif.jpl.nasa.gov/pub/naif/generic_kernels/\n"
-            "=" * 70
-        )
-    for k in KERNELS:
-        spice.furnsh(k)
-    GM.clear()
-    for body in BODIES:
-        GM[body] = float(spice.bodvrd(body, "GM", 1)[1][0])
+class SpiceEnv:
+    """
+    Bundles everything SPICE-side that stays constant for a simulation run:
+    kernel set, body list, reference frame, aberration correction, observer.
+    Loads the kernels and reads GM at construction so the rest of the code
+    just calls `env.body_position(body, et)` / `env.GM[body]` etc.
+
+    Note: SPICE state is process-global (spice.furnsh registers kernels in a
+    shared pool), so only one SpiceEnv per process is meaningful — but having
+    it as an object keeps the universal args out of every call site.
+    """
+
+    def __init__(
+        self,
+        kernels:  list[str]        = KERNELS,
+        bodies:   tuple[str, ...]  = BODIES,
+        frame:    str              = "J2000",
+        abcorr:   str              = "NONE",
+        observer: str              = "SSB",
+    ):
+        self.kernels  = kernels
+        self.bodies   = bodies
+        self.frame    = frame
+        self.abcorr   = abcorr
+        self.observer = observer
+
+        self._furnish()
+        # GM dict [km^3/s^2], read from the PCK once at startup.
+        self.GM: dict[str, float] = {
+            body: float(spice.bodvrd(body, "GM", 1)[1][0]) for body in self.bodies
+        }
+
+    def _furnish(self) -> None:
+        """Furnish SPICE kernels (raises a helpful error if any are missing)."""
+        if not all(Path(k).exists() for k in self.kernels):
+            raise FileNotFoundError(
+                "\n" + "=" * 70 + "\n"
+                "SPICE kernels not found!\n\n"
+                "Required kernels are missing from data/spice_kernels/\n"
+                "Download them automatically using:\n\n"
+                "  pip install -e .\n"
+                "  lifecontrol-setup-kernels\n\n"
+                "Or manually from NAIF:\n"
+                "  https://naif.jpl.nasa.gov/pub/naif/generic_kernels/\n"
+                "=" * 70
+            )
+        for k in self.kernels:
+            spice.furnsh(k)
+
+    # ── Ephemeris lookup ─────────────────────────────────────────────────
+    def body_position(self, body: str, et: float) -> np.ndarray:
+        """Position of `body` at epoch `et`, in (frame, observer) [km]."""
+        return spice.spkpos(body, et, self.frame, self.abcorr, self.observer)[0]
+
+    # ── Time conversions (thin wrappers, kept for symmetry) ──────────────
+    def str2et(self, s: str) -> float:
+        return spice.str2et(s)
+
+    def et2utc(self, et: float, fmt: str = "ISOC", prec: int = 3) -> str:
+        return spice.et2utc(et, fmt, prec)
 
 
 # ── Spacecraft constant parameters (single spacecraft, for the moment) ───────
@@ -102,20 +138,14 @@ def load_kernels() -> None:
 # x-axis spin couples into the other body axes (visible in the plots).
 J_B = np.diag([100.0, 100.0, 100.0])
 J_B[1, 2] = 10.0
-J_B[2, 1] = 10.0   # mirror to keep J symmetric
-J_B_inv: np.ndarray = np.linalg.inv(J_B)
-
-# Inertia rate dJ/dt in body frame [kg * m^2 / s].
-# Per Eq. (16) this is driven by mass depletion: J_dot = m_dot * K_r.
-# With zero control (no thrust), m_dot = 0, so J_dot = 0.
-J_B_dot: np.ndarray = np.zeros((3, 3))             # [kg * m^2 / s]
+J_B[2, 1] = 10.0   # mirror to keep J symmetric --> edit --> SEE Scharf et a. Overivew of TPF...
 
 # SRP parameters (kept here for when a_SRP is enabled). Currently unused
 # because a_SRP is set to zero per the doc's "set to 0 for the moment".
 C_R: float = 1.8                                    # reflectivity in [1, 2], (JWST cannonball, Farres & Petersen (2019), AAS 19-657), https://ntrs.nasa.gov/api/citations/20190029609/downloads/20190029609.pdf
 A_SRP: float = 40.0                                 # effective area [m^2], rough estimate for LIFE collector spacecraft
 P_SUN: float = 4.53e-6                              # solar pressure at 1 AU [N/m^2], (JWST cannonball, Farres & Petersen (2019), AAS 19-657), https://ntrs.nasa.gov/api/citations/20190029609/downloads/20190029609.pdf
-R_SUN_REF_KM: float = 1.495978707e8                 # reference distance [km] (1 AU), 
+R_SUN_REF_KM: float = 1.495978707e8                 # reference distance [km] (1 AU),
 
 # Unit conversion: SRP gives m/s^2 natively; rest of dynamics is in km.
 KM_PER_M: float = 1.0e-3
@@ -125,218 +155,193 @@ ISP: float = 220.0                                  # [s]
 G0: float = 9.80665e-3                              # [km/s^2]  (note: km units)
 
 
-# ── Gravitational acceleration ───────────────────────────────────────────────
+# ── Plant: single-spacecraft dynamics + integrator ───────────────────────────
 
-def a_grav(r_I: np.ndarray, et: float) -> np.ndarray:
+class Plant:
     """
-    N-body gravitational acceleration on the spacecraft, in ICRF [km/s^2].
-
-    Implements Eq. (7):
-        a_grav^I = sum_b  -mu_b * (r_IB^I - r_Ib^I) / |r_IB^I - r_Ib^I|^3
+    Dynamics of one spacecraft (14-state, Eq. (6)) bundled with a single-step
+    integrator. Holds the spacecraft constants as instance attributes so that
+    multi-spacecraft support is a matter of instantiating more Plants. Takes
+    a SpiceEnv so all ephemeris lookups go through one configured object.
     """
-    a = np.zeros(3)
-    for body, mu in GM.items():
-        r_b = spice.spkezr(body, et, "J2000", "NONE", "SSB")[0][:3]
-        dr = r_I - r_b
-        a -= mu * dr / np.linalg.norm(dr) ** 3
-    return a
 
-def a_SRP(r_I: np.ndarray, m: float, et: float) -> np.ndarray:
-    """
-    Cannonball solar radiation pressure acceleration on the spacecraft,
-    in ICRF [km/s^2].
+    def __init__(
+        self,
+        env:   SpiceEnv,
+        J_B:   np.ndarray = J_B,
+        C_R:   float      = C_R,
+        A_SRP: float      = A_SRP,
+        ISP:   float      = ISP,
+    ):
+        self.env     = env
+        self.J_B     = J_B
+        self.J_B_inv = np.linalg.inv(J_B)
+        # Inertia rate dJ/dt in body frame [kg * m^2 / s].
+        # Per Eq. (16) this is driven by mass depletion: J_dot = m_dot * K_r.
+        # With zero control (no thrust), m_dot = 0, so J_dot = 0.
+        self.J_B_dot = np.zeros((3, 3))
+        self.C_R     = C_R
+        self.A_SRP   = A_SRP
+        self.ISP     = ISP
 
-    Implements (the corrected form of) Eq. (8):
+    # ── Gravitational acceleration ───────────────────────────────────────
+    def a_grav(self, r_I: np.ndarray, et: float) -> np.ndarray:
+        """
+        N-body gravitational acceleration on the spacecraft, in ICRF [km/s^2].
 
-        a_SRP^I = C_R * (A / m) * P_sun * (r_sun_ref / r)^2 * u_hat
+        Implements Eq. (7):
+            a_grav^I = sum_b  -mu_b * (r_IB^I - r_Ib^I) / |r_IB^I - r_Ib^I|^3
+        """
+        a = np.zeros(3)
+        for body, mu in self.env.GM.items():
+            r_b = self.env.body_position(body, et)
+            dr  = r_I - r_b
+            a  -= mu * dr / np.linalg.norm(dr) ** 3
+        return a
 
-    where:
-        u_hat = (r_IB^I - r_Is^I) / |r_IB^I - r_Is^I|
-                is the unit vector from the Sun toward the spacecraft
-                (so SRP pushes the spacecraft *away* from the Sun),
-        r     = |r_IB^I - r_Is^I| is the Sun-spacecraft distance,
-        P_sun is the solar pressure at the reference distance r_sun_ref = 1 AU,
-              so "P_sun * (r_sun_ref / r)^2" reproduces the 1/r^2 falloff
-              of solar flux.
+    # ── Solar radiation pressure ─────────────────────────────────────────
+    def a_srp(self, r_I: np.ndarray, m: float, et: float) -> np.ndarray:
+        """
+        Cannonball solar radiation pressure acceleration on the spacecraft,
+        in ICRF [km/s^2].
 
-    No eclipse / shadow function is included, matching the doc's Eq. (8).
-    For an L2 halo orbit this is essentially fine (s/c is in continuous
-    sunlight); it would need to be added for trajectories that cross
-    Earth's umbra.
+        Implements (the corrected form of) Eq. (8):
 
-    Args:
-        r_I : (3,) spacecraft position in ICRF [km]
-        m   : spacecraft mass [kg]
-        et  : SPICE ephemeris time [s]
+            a_srp^I = C_R * (A / m) * P_sun * (r_sun_ref / r)^2 * u_hat
 
-    Returns:
-        a_SRP^I : (3,) acceleration in ICRF [km/s^2]
-    """
-    # Sun position in the same frame the rest of the dynamics uses.
-    r_sun = spice.spkezr("SUN", et, "J2000", "NONE", "SSB")[0][:3]
+        where:
+            u_hat = (r_IB^I - r_Is^I) / |r_IB^I - r_Is^I|
+                    is the unit vector from the Sun toward the spacecraft
+                    (so SRP pushes the spacecraft *away* from the Sun),
+            r     = |r_IB^I - r_Is^I| is the Sun-spacecraft distance,
+            P_sun is the solar pressure at the reference distance r_sun_ref = 1 AU,
+                  so "P_sun * (r_sun_ref / r)^2" reproduces the 1/r^2 falloff
+                  of solar flux.
 
-    # Sun -> spacecraft vector. Force points away from the Sun, so this
-    # vector (without a minus sign) is exactly the direction of a_SRP.
-    d      = r_I - r_sun
-    d_norm = np.linalg.norm(d)
-    u_hat  = d / d_norm
+        No eclipse / shadow function is included, matching the doc's Eq. (8).
+        For an L2 halo orbit this is essentially fine (s/c is in continuous
+        sunlight); it would need to be added for trajectories that cross
+        Earth's umbra.
+        """
+        r_sun  = self.env.body_position("SUN", et)
+        d      = r_I - r_sun                            # Sun -> spacecraft
+        d_norm = np.linalg.norm(d)
+        u_hat  = d / d_norm
 
-    # Pressure scaling with distance: P(r) = P_SUN * (R_SUN_REF / r)^2 [N/m^2].
-    P_at_r = P_SUN * (R_SUN_REF_KM / d_norm) ** 2
+        # Pressure scaling with distance: P(r) = P_SUN * (R_SUN_REF / r)^2 [N/m^2].
+        P_at_r          = P_SUN * (R_SUN_REF_KM / d_norm) ** 2
+        a_mag_km_per_s2 = self.C_R * (self.A_SRP / m) * P_at_r * KM_PER_M
+        return a_mag_km_per_s2 * u_hat
 
-    # Acceleration magnitude in m/s^2, then convert to km/s^2.
-    a_mag_m_per_s2  = C_R * (A_SRP / m) * P_at_r
-    a_mag_km_per_s2 = a_mag_m_per_s2 * KM_PER_M
+    # ── ODE right-hand side (14-state) ───────────────────────────────────
+    def x_dot(self, tau: float, x: np.ndarray, et0: float, u: np.ndarray) -> np.ndarray:
+        """
+        State x (14,):
+            x[0:3]   r_IB^I    position           [km]
+            x[3:6]   v_IB^I    velocity           [km/s]
+            x[6:10]  q_I^B     attitude quaternion (inertial -> body)
+            x[10:13] w_IB^B    angular rate, body frame   [rad/s]
+            x[13]    m         mass               [kg]
 
-    return a_mag_km_per_s2 * u_hat
+        Control u (6,):
+            u[0:3]   a_ctrl^I  control acceleration, inertial    [km/s^2]
+            u[3:6]   tau_ctrl^B control torque, body             [N*m]
+        """
+        r, v, q, omega, m = x[0:3], x[3:6], x[6:10], x[10:13], x[13]
+        a_ctrl, tau_ctrl  = u[0:3], u[3:6]
 
+        # --- Translational dynamics (Eq. 6, row 2) ----------------------------
+        a_gravity  = self.a_grav(r, et0 + tau)          # full N-body, active
+        a_rad      = self.a_srp(r, m, et0 + tau)        # Eq. (8), cannonball SRP
+        a_ion      = np.zeros(3)                        # Eq. (9), set to 0
+        a_grav_isc = np.zeros(3)                        # Eq. (10), inter-s/c gravity, set to 0
+        a_p        = np.zeros(3)                        # Eq. (12), process noise, set to 0
 
-# ── ODE right-hand side (single spacecraft, 14-state) ────────────────────────
+        r_dot = v
+        v_dot = a_gravity + a_rad + a_ion + a_grav_isc + a_ctrl + a_p
 
-def x_dot_i(t: float, x: np.ndarray, et0: float, u: np.ndarray) -> np.ndarray:
-    """
-    ODE right-hand side for the coupled translational + rotational dynamics
-    of a single spacecraft.
+        # --- Attitude kinematics (Eq. 6, row 3) -------------------------------
+        q_dot = 0.5 * Omega_omega(omega) @ q
 
-    State x (14,):
-        x[0:3]   r_IB^I    position           [km]
-        x[3:6]   v_IB^I    velocity           [km/s]
-        x[6:10]  q_I^B     attitude quaternion (inertial -> body)
-        x[10:13] w_IB^B    angular rate, body frame   [rad/s]
-        x[13]    m         mass               [kg]
+        # --- Rotational dynamics (Eq. 6, row 4) -------------------------------
+        # J * dot omega = tau_SRP + tau_ctrl + tau_p - omega x (J omega) - J_dot omega
+        tau_SRP = np.zeros(3)                           # Eq. (14), set to 0
+        tau_p   = np.zeros(3)                           # Eq. (15), set to 0
+        omega_dot = self.J_B_inv @ (
+            tau_SRP + tau_ctrl + tau_p
+            - np.cross(omega, self.J_B @ omega)
+            - self.J_B_dot @ omega
+        )
 
-    Control u (6,):
-        u[0:3]   a_ctrl^I  control acceleration, inertial    [km/s^2]
-        u[3:6]   tau_ctrl^B control torque, body             [N*m]
+        # --- Mass dynamics (Eq. 6, row 5) -------------------------------------
+        # dot m = - sum_l |f_ctrl,l| / (Isp_l * g0). No control thrust -> 0.
+        m_dot = 0.0
 
-    Returns dx/dt of shape (14,).
-    """
-    # --- Unpack state ---
-    r     = x[0:3]
-    v     = x[3:6]
-    q     = x[6:10]
-    omega = x[10:13]
-    m     = x[13]
+        return np.concatenate([r_dot, v_dot, q_dot, omega_dot, [m_dot]])
 
-    # --- Unpack control ---
-    a_ctrl   = u[0:3]   # [km/s^2] in inertial frame
-    tau_ctrl = u[3:6]   # [N*m]    in body frame
+    # ── Single-step propagator ───────────────────────────────────────────
+    def step(
+        self,
+        x:           np.ndarray,
+        u:           np.ndarray,
+        t:           float,
+        dt:          float,
+        rtol:        float = 1e-12,
+        atol:        float = 1e-12,
+        renormalize: bool  = True,
+    ) -> np.ndarray:
+        """
+        Advance x by one control sample dt [s] from epoch t [SPICE ET],
+        with zero-order-hold control u over the interval. Returns x_next (14,).
+        """
+        sol = solve_ivp(
+            self.x_dot, (0.0, dt), x,
+            method = "DOP853",
+            args   = (t, u),
+            rtol   = rtol,
+            atol   = atol,
+        )
+        if not sol.success:
+            raise RuntimeError(f"Integration failed: {sol.message}")
 
-    # --- Translational dynamics (Eq. 6, row 2) ----------------------------
-    # dot r = v
-    # dot v = a_grav + a_SRP + a_ion + a_grav(isc) + a_ctrl + a_p
-    a_gravity     = a_grav(r, et0 + t)              # full N-body, active
-    a_srp         = a_SRP(r, m, et0 + t)            # Eq. (8), cannonball SRP
-    a_ion         = np.zeros(3)                     # Eq. (9), set to 0
-    a_grav_isc    = np.zeros(3)                     # Eq. (10), inter-s/c gravity, set to 0
-    a_p           = np.zeros(3)                     # Eq. (12), process noise, set to 0
-
-    r_dot = v
-    v_dot = a_gravity + a_srp + a_ion + a_grav_isc + a_ctrl + a_p
-
-    # --- Attitude kinematics (Eq. 6, row 3) -------------------------------
-    # dot q = 0.5 * Omega(omega) * q
-    q_dot = 0.5 * Omega_omega(omega) @ q
-
-    # --- Rotational dynamics (Eq. 6, row 4) -------------------------------
-    # J * dot omega = tau_SRP + tau_ctrl + tau_p - omega x (J omega) - J_dot omega
-    tau_SRP = np.zeros(3)                           # Eq. (14), set to 0
-    tau_p   = np.zeros(3)                           # Eq. (15), set to 0
-
-    tau_total = tau_SRP + tau_ctrl + tau_p
-    omega_dot = J_B_inv @ (
-        tau_total
-        - np.cross(omega, J_B @ omega)
-        - J_B_dot @ omega
-    )
-
-    # --- Mass dynamics (Eq. 6, row 5) -------------------------------------
-    # dot m = - sum_l |f_ctrl,l| / (Isp_l * g0)
-    # No control thrust -> no mass change for the moment.
-    m_dot = 0.0
-
-    return np.concatenate([
-        r_dot,
-        v_dot,
-        q_dot,
-        omega_dot,
-        np.array([m_dot]),
-    ])
-
-
-# ── Propagator / single-step integrator ──────────────────────────────────────
-
-def step(
-    x:           np.ndarray,
-    dt:          float,
-    et:          float,
-    u:           np.ndarray | None = None,
-    rtol:        float = 1e-12,
-    atol:        float = 1e-12,
-    renormalize: bool = True,
-) -> np.ndarray:
-    """
-    Advance the 14-state x by one control sample dt [s] from epoch et,
-    with zero-order-hold control u over the interval.
-
-    renormalize : if True (default), normalize the quaternion after the step
-                  to fight numerical drift. Set False when measuring raw
-                  ODE drift in tests.
-
-    Returns x_next (14,).
-    """
-    if u is None:
-        u = np.zeros(6)
-
-    sol = solve_ivp(
-        x_dot_i, (0.0, dt),
-        x,
-        method       = "DOP853",
-        args         = (et, u),
-        rtol         = rtol,
-        atol         = atol,
-        dense_output = False,
-    )
-    if not sol.success:
-        raise RuntimeError(f"Integration failed: {sol.message}")
-
-    x_next = sol.y[:, -1]
-
-    if renormalize:
-        q = x_next[6:10]
-        x_next[6:10] = q / np.linalg.norm(q)
-
-    return x_next
+        x_next = sol.y[:, -1]
+        if renormalize:                                # fight quaternion drift
+            x_next[6:10] = x_next[6:10] / np.linalg.norm(x_next[6:10])
+        return x_next
 
 
 # ── Demo: epoch-stepping main loop ───────────────────────────────────────────
 
 if __name__ == "__main__":
-    load_kernels()
+    # SPICE environment: loads kernels and reads GM at construction.
+    env = SpiceEnv()
 
     print("GM values loaded from gm_de440.tpc [km^3/s^2]:")
-    for body, mu in GM.items():
+    for body, mu in env.GM.items():
         print(f"  {body:<20s} {mu: .10e}")
 
     # --- Initial epoch ----------------------------------------------------
-    et0 = spice.str2et("2026-05-12T00:00:00")
+    et0 = env.str2et("2026-05-12T00:00:00")
 
     # --- Initial spacecraft state -----------------------------------------
     # Approximate Sun-Earth L2 halo-like initial condition from JWST: https://ssd.jpl.nasa.gov/horizons/app.html#/
-    r0 = np.array([-9.594503991242750e7, -1.098032827423822e8,-4.778858640538428e7 ])
-    v0 = np.array([2.279303677102495e1, -1.735582913273474e1, -7.640659579588683e0])
+    r0 = np.array([-9.594503991242750e7, -1.098032827423822e8,-4.778858640538428e7 ])   # [km]
+    v0 = np.array([2.279303677102495e1, -1.735582913273474e1, -7.640659579588683e0])    # [km/s]
     q0 = np.array([1.0, 0.0, 0.0, 0.0])           # identity quaternion (scalar-first)
     w0 = np.array([0.001, 0.01, 0.0])               # [rad/s]  small body-x spin and some small y to couple into the other axes; not based on any real data, just for demo purposes
     m0 = 3000.0                                    # [kg]
 
     x = np.concatenate([r0, v0, q0, w0, np.array([m0])])
 
-    print(f"\nEpoch  : {spice.et2utc(et0, 'ISOC', 3)}")
+    print(f"\nEpoch  : {env.et2utc(et0)}")
     print(f"r0     : {x[0:3]}  km")
     print(f"v0     : {x[3:6]}  km/s")
     print(f"q0     : {x[6:10]}")
     print(f"w0     : {x[10:13]}  rad/s")
     print(f"m0     : {x[13]}  kg")
+
+    # --- Instantiate the spacecraft plant --------------------------------
+    plant = Plant(env)
 
     # --- Main control loop -----------------------------------------------
     # 1 day at 2 s sampling -> 43200 samples. With omega ~ 0.01 rad/s the spin
@@ -361,7 +366,7 @@ if __name__ == "__main__":
         u = np.zeros(6)
 
         # Propagate one step forward.
-        x_next = step(x, dt=dt, et=et, u=u)
+        x_next = plant.step(x, u, et, dt)
 
         # Store history.
         t_hist[k + 1]    = (k + 1) * dt
