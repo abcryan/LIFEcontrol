@@ -463,10 +463,6 @@ def deputy_absolute_position(x: np.ndarray, i: int) -> np.ndarray:
     """
     Return the absolute ICRF position of deputy i (i >= 1) from a stacked
     state vector x. For i = 0, returns the chief's absolute position directly.
-
-    This is only intended for plotting / measurement-model evaluation — it
-    re-introduces the absolute scale and so should NEVER be used to compute
-    relative quantities between deputies. Use δr_i - δr_j for that.
     """
     if i == 0:
         return x[0:3].copy()
