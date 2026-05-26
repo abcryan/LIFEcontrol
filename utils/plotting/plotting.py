@@ -19,8 +19,6 @@ import spiceypy as spice
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-from utils.coordinate_trafos.Quat_to_Euler import quat_to_euler
-
 
 # State block size (must match main.py NX_PER_SC).
 NX_PER_SC: int = 14
@@ -125,7 +123,7 @@ def plot_trajectory(
         (0,2)  Baseline magnitudes |δr_i|(t) for each deputy
         (1,0)  Chief position components
         (1,1)  Chief velocity components
-        (1,2)  Chief Euler angles, full window
+        (1,2)  Chief attitude quaternion components (q0, q1, q2, q3)
         (2,0)  Per-deputy relative δr in chief-centered ICRF, x/y/z vs time
         (2,1)  All spacecraft angular velocity magnitudes
         (2,2)  Chief conservation diagnostics
@@ -134,11 +132,6 @@ def plot_trajectory(
     chief    = _chief_state(X_hist)
     deputies = [_deputy_state(X_hist, i) for i in range(1, N)]
     t_h      = t_hist / 3600.0
-
-    # Chief Euler angles for the attitude panel.
-    chief_euler_rad = np.array([quat_to_euler(qk) for qk in chief["q"]])
-    chief_euler_rad = np.unwrap(chief_euler_rad, axis=0)
-    chief_euler_deg = np.degrees(chief_euler_rad)
 
     # Earth track for the chief 3D panel.
     n_ref = 200
@@ -219,15 +212,21 @@ def plot_trajectory(
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best", fontsize=9)
 
-    # (1,2) Chief Euler angles (full window)
+    # (1,2) Chief attitude quaternion components
+    # Plotted directly (no Euler decomposition) to avoid the gimbal-lock
+    # artifacts that show up in ZYX Euler when the body rotates through
+    # θ = ±π/2. Quaternions are smooth on SO(3).
     ax = plt.subplot2grid((3, 3), (1, 2), fig=fig)
-    ax.plot(t_h, chief_euler_deg[:, 0], "r-", lw=0.9, label=r"$\phi$ (roll)")
-    ax.plot(t_h, chief_euler_deg[:, 1], "g-", lw=0.9, label=r"$\theta$ (pitch)")
-    ax.plot(t_h, chief_euler_deg[:, 2], "b-", lw=0.9, label=r"$\psi$ (yaw)")
-    ax.set_xlabel("time [h]"); ax.set_ylabel("angle [deg]")
-    ax.set_title("Chief Euler angles (unwrapped)")
+    ax.plot(t_h, chief["q"][:, 0], color="#000000", lw=0.9, label=r"$q_0$ (scalar)")
+    ax.plot(t_h, chief["q"][:, 1], color="#D62728", lw=0.9, label=r"$q_1$")
+    ax.plot(t_h, chief["q"][:, 2], color="#2CA02C", lw=0.9, label=r"$q_2$")
+    ax.plot(t_h, chief["q"][:, 3], color="#1F77B4", lw=0.9, label=r"$q_3$")
+    ax.axhline(0.0, color="gray", lw=0.4, alpha=0.5)
+    ax.set_xlabel("time [h]"); ax.set_ylabel("quaternion component")
+    ax.set_title(r"Chief attitude quaternion $q_I^B$ components")
+    ax.set_ylim(-1.05, 1.05)
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="best", fontsize=8)
+    ax.legend(loc="best", fontsize=8, ncol=2)
 
     # (2,0) Per-deputy δr components vs time (in chief-centered ICRF)
     ax = plt.subplot2grid((3, 3), (2, 0), fig=fig)

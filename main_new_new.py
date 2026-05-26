@@ -1,3 +1,39 @@
+"""
+LIFE Mission — High-Fidelity Truth Model (Translational + Rotational Dynamics)
+
+N-spacecraft formation: 1 LEADER + (N-1) FOLLOWERS, leader-plus-relative form.
+
+Per spacecraft state layout (14 components):
+    x[0:3]    r or δr        position           [km]    (leader: absolute,
+                                                         follower: relative to leader)
+    x[3:6]    v or δv        velocity           [km/s]  (same convention)
+    x[6:10]   q_I^B          quaternion (inertial → body, absolute)
+    x[10:13]  ω_IB^B         angular rate, body frame              [rad/s]
+    x[13]     m_prop         propellant mass remaining             [kg]
+                              (total mass = m_cyl + m_ring_dry + m_prop)
+
+Per spacecraft control (20 components):
+    u[0:20]   T_1 ... T_20   non-negative thrust magnitudes        [N]
+                              for the 20 ring-mounted thrusters
+                              (positions and directions defined in
+                               config.spacecraft.thrusters, matching
+                               Section 3.4 of the design document)
+
+Spacecraft physical model (per role):
+    Outer ring  (constant-mass structure + propellant tanks)  +
+    inner solid cylinder (constant mass).  Both are concentric → total
+    inertia adds directly with no parallel-axis term.  The propellant
+    is housed inside the ring; the ring's *geometric envelope* (and
+    therefore K_ring) is treated as constant, while its mass varies as
+    propellant burns.  J̇ comes entirely from the changing ring mass.
+
+Control allocation (in body frame, with T_l ≥ 0):
+    F^B   = - B_F   @ T          [N]      (3 × 20)
+    τ^B   = - B_TAU @ T          [N·m]    (3 × 20)
+    ṁ_prop = - (Σ T_l) / (Isp · g0)         (each thruster contributes)
+Force is transformed to inertial via the attitude quaternion before being
+used in the translational dynamics → rotation-translation coupling.
+"""
 
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -8,7 +44,17 @@ from types import SimpleNamespace
 
 # File Imports
 from config.mission.config import KERNELS, BODIES, FRAME, ABCORR, OBSERVER
+from config.spacecraft.thrusters import (
+    THRUSTER_POSITIONS,
+    THRUSTER_NORMALS,
+    B_F,
+    B_TAU,
+    N_THRUSTERS,
+    clamp_thrust,
+    force_torque_body,
+)
 from utils.other.Omega_omega import Omega_omega
+from utils.coordinate_trafos.Quat_to_CTM import quat_to_CTM
 from utils.plotting.plotting import (
     plot_trajectory,
     plot_solar_system,
@@ -63,78 +109,96 @@ class SpiceEnv:
 @dataclass(frozen=True)
 class Parameters:
 
-    # ── Physical constants ──────────────────────────────────────────────
-    P_SUN           = 4.53e-6           # solar pressure at 1 AU [N/m^2]
-    R_SUN_REF_KM    = 1.495978707e8     # 1 AU [km]
-    G_0             = 9.80665e-3        # standard Earth surface gravity [km/s^2]
+    # ── Universal constants ─────────────────────────────────────
+    P_SUN           = 4.53e-6           # solar pressure at 1 AU   [N/m^2]
+    R_SUN_AU        = 1.495978707e8     # 1 AU                     [km]
+    G0              = 9.80665e-3        # standard gravity         [km/s^2]
+    KM_PER_M        = 1.0e-3            # km / m
+    N_PER_KN        = 1.0e3             # N per kN
 
-    # ── Spacecraft parameters (Leader / Follower) ───────────────────────
-    m_init_L        = 4000.0  # [kg]
-    m_init_F        = 3000.0  # [kg]
+    # ── Spacecraft masses [kg] ──────────────────────────────────
+    # Mass decomposition per spacecraft:
+    #     m_total(t) = m_cyl + m_ring_dry + m_prop(t)
+    #     m_total(0) = m_init
+    # m_cyl       : inner solid cylinder, structural, constant
+    # m_ring_dry  : outer ring structure (walls, tanks, plumbing), constant
+    # m_prop      : propellant inside the ring, variable, 0 ≤ m_prop ≤ m_prop_init
+    m_init_L        = 4150.0            # leader   total initial mass
+    m_init_F        = 3150.0            # follower total initial mass
+    m_cylinder_L    = 3000.0            # leader   inner cylinder (constant)
+    m_cylinder_F    = 2000.0            # follower inner cylinder (constant)
+    m_prop_init_L   = 150.0             # leader   usable propellant
+    m_prop_init_F   = 150.0             # follower usable propellant
 
-    m_cylinder_L    = 3000.0  # [kg]  (fuel-bearing section, mass varies)
-    m_cylinder_F    = 2000.0  # [kg]
+    # ── Spacecraft off-diagonal inertia contributions ───────────
+    # In case you want to include some off-diagonal perturbation.
+    # Currently applies to L and F equally AND only to cylinder inertia
+    off_diag_frac   = 1.0e-4
+    OFF_xy          = True
+    OFF_xz          = True
+    OFF_yz          = True
 
-    h_cylinder_L    = 5.0     # [m]
-    h_cylinder_F    = 4.8     # [m]
 
-    h_ring          = 1.2     # [m]
-    r_cylinder      = 2.57    # [m]
-    r_in            = 2.7     # [m]
-    r_out           = 3.8     # [m]
+    # ── Spacecraft geometry [m] ─────────────────────────────────
+    h_cylinder_L    = 5.0               # leader   cylinder height
+    h_cylinder_F    = 4.8               # follower cylinder height
+    h_ring          = 1.2               # ring height (shared)
+    r_cylinder      = 2.57              # cylinder radius (shared)
+    r_in            = 2.7               # ring inner radius (shared)
+    r_out           = 3.8               # ring outer radius (shared)
 
-    c_reflect       = 1.8     # SRP reflectivity coefficient
+    # ── Propulsion ──────────────────────────────────────────────
+    ISP_L           = 220.0             # leader   specific impulse [s]
+    ISP_F           = 220.0             # follower specific impulse [s]
+    T_MAX           = 20.0              # max thrust PER THRUSTER  [N]
+                                         # (used to saturate the control input
+                                         #  in the truth model; matches the
+                                         #  20 N upper bound in Malladi et al.
+                                         #  Sec. IV; user may tune this freely)
 
-    Isp_L           = 220.0   # [s]
-    Isp_F           = 220.0   # [s]
+    # ── SRP ─────────────────────────────────────────────────────
+    c_reflect       = 1.8               # SRP reflectivity coefficient (Webb-like)
 
-    # ── Derived (computed in __post_init__) ─────────────────────────────
-    m_ring_L:           float      = field(init=False)
-    m_ring_F:           float      = field(init=False)
-    J_cylinder_L:       np.ndarray = field(init=False)
-    J_cylinder_F:       np.ndarray = field(init=False)
-    J_ring_L:           np.ndarray = field(init=False)
-    J_ring_F:           np.ndarray = field(init=False)
-    J_init_L:           np.ndarray = field(init=False)
-    J_init_F:           np.ndarray = field(init=False)
-    J_ring_per_mass_L:  np.ndarray = field(init=False)
-    J_ring_per_mass_F:  np.ndarray = field(init=False)
-    SRP_area_L:         float      = field(init=False)
-    SRP_area_F:         float      = field(init=False)
+    # ── Derived (computed in __post_init__) ─────────────────────
+    J_cylinder_L:   np.ndarray = field(init=False)
+    J_cylinder_F:   np.ndarray = field(init=False)
+    J_init_L:       np.ndarray = field(init=False)
+    J_init_F:       np.ndarray = field(init=False)
+    SRP_area_L:     float      = field(init=False)
+    SRP_area_F:     float      = field(init=False)
+    m_ring_dry_L:   float      = field(init=False)
+    m_ring_dry_F:   float      = field(init=False)
 
     def __post_init__(self):
-        # frozen=True needs object.__setattr__ for derived fields
+        # frozen=True forbids normal assignment — bypass via object.__setattr__
         s = lambda k, v: object.__setattr__(self, k, v)
 
-        # Constant ring mass = initial total - cylinder mass (only cylinder burns)
-        m_ring_L = mass_ring(self.m_init_L, self.m_cylinder_L)
-        m_ring_F = mass_ring(self.m_init_F, self.m_cylinder_F)
-        s("m_ring_L", m_ring_L)
-        s("m_ring_F", m_ring_F)
-
-        # Cylinder (fuel-bearing) inertia at initial mass
+        # ── Inner-cylinder inertias (constant) ──
         J_cyl_L = inertia_cylinder(self.m_cylinder_L, self.r_cylinder, self.h_cylinder_L)
         J_cyl_F = inertia_cylinder(self.m_cylinder_F, self.r_cylinder, self.h_cylinder_F)
         s("J_cylinder_L", J_cyl_L)
         s("J_cylinder_F", J_cyl_F)
 
-        # Ring inertia (constant, geometry+mass fixed)
-        J_ring_L = inertia_ring(m_ring_L, self.r_in, self.r_out, self.h_ring)
-        J_ring_F = inertia_ring(m_ring_F, self.r_in, self.r_out, self.h_ring)
-        s("J_ring_L", J_ring_L)
-        s("J_ring_F", J_ring_F)
+        # ── Dry ring mass = what's left of m_init after subtracting cylinder
+        # and propellant. Must be non-negative.
+        m_ring_dry_L = self.m_init_L - self.m_cylinder_L - self.m_prop_init_L
+        m_ring_dry_F = self.m_init_F - self.m_cylinder_F - self.m_prop_init_F
+        if m_ring_dry_L < 0 or m_ring_dry_F < 0:
+            raise ValueError(
+                "Negative ring dry mass — check m_init, m_cylinder, m_prop_init."
+            )
+        s("m_ring_dry_L", m_ring_dry_L)
+        s("m_ring_dry_F", m_ring_dry_F)
 
-        # Total initial inertia (ring + cylinder)
-        s("J_init_L", J_ring_L + J_cyl_L)
-        s("J_init_F", J_ring_F + J_cyl_F)
+        # ── Initial inertias (full ring mass = dry + propellant) ──
+        m_ring_init_L = m_ring_dry_L + self.m_prop_init_L
+        m_ring_init_F = m_ring_dry_F + self.m_prop_init_F
+        s("J_init_L", inertia(m_ring_init_L, self.r_in, self.r_out, self.h_ring, J_cyl_L, self.off_diag_frac, 
+                       self.OFF_xy, self.OFF_xz, self.OFF_yz))
+        s("J_init_F", inertia(m_ring_init_F, self.r_in, self.r_out, self.h_ring, J_cyl_F, self.off_diag_frac, 
+                       self.OFF_xy, self.OFF_xz, self.OFF_yz))
 
-        # Per-unit-mass RING inertia (constant geometry). Per the design doc the
-        # ring is the fuel-bearing section, so m_r,i is the time-varying mass and
-        #   J_ring(t) = m_r,i(t) * J_ring_per_mass   =>   J̇ = ṁ * J_ring_per_mass
-        s("J_ring_per_mass_L", inertia_ring(1.0, self.r_in, self.r_out, self.h_ring))
-        s("J_ring_per_mass_F", inertia_ring(1.0, self.r_in, self.r_out, self.h_ring))
-
-        # Effective SRP cross-section (projected rectangle of the cylinder)
+        # Cylindrical "cannonball" projected area (rectangle 2r × h)
         s("SRP_area_L", 2 * self.r_cylinder * self.h_cylinder_L)
         s("SRP_area_F", 2 * self.r_cylinder * self.h_cylinder_F)
 
@@ -179,35 +243,38 @@ class Controller:
 
 class Plant:
     """
-    Plant Truth Model of the System.
+    Truth model dynamics for an N-spacecraft formation.
 
-    N-spacecraft formation:
-      - Spacecraft 0 is the LEADER: absolute state in SSB-centered ICRF.
-      - Spacecraft 1..N-1 are FOLLOWERS: relative translational state (δr, δv)
-        w.r.t. the Leader in ICRF, plus absolute attitude.
+      - Spacecraft 0 = LEADER:    absolute (r, v) in SSB-centred ICRF.
+      - Spacecraft i > 0 = FOLLOWER: relative (δr, δv) w.r.t. leader in ICRF,
+        plus ABSOLUTE attitude.  Relative form avoids the ~mm-level numerical
+        floor incurred by differencing two ~1.5e8 km SSB-relative vectors.
 
-    Relative form for the follower's translation is required to avoid the
-    ~200 µm/day numerical floor that comes from differencing two ~1 AU
-    SSB-relative position vectors at double precision. Attitude states stay
-    absolute (unit-magnitude quaternions don't suffer that cancellation).
+    Per-spacecraft physical model:
+        outer ring   (variable mass — fuel)
+        inner cylinder (constant mass)
+      Inertia tensor is computed as J(m) = J_cyl + J_ring(m_ring(m)) and
+      tracks m through the burn.  J̇ comes solely from the ring term.
     """
 
     def __init__(self, env, param, n_sc, dim_x_sc, dim_u_sc):
-        self.env        = env
-        self.param      = param
-        self.n_sc       = n_sc
-        self.dim_x_sc   = dim_x_sc
-        self.dim_u_sc   = dim_u_sc
-        self.dim_x      = n_sc * dim_x_sc
-        self.dim_u      = n_sc * dim_u_sc
+        self.env       = env
+        self.param     = param
+        self.n_sc      = n_sc
+        self.dim_x_sc  = dim_x_sc
+        self.dim_u_sc  = dim_u_sc
+
+    # ── Single-step propagator ──────────────────────────────────────────────
 
     def step(self, x, u, t, dt,
              rtol = 1e-12, atol = 1e-12, renormalize = True):
 
-        # Propagate full dynamics
         sol = solve_ivp(self.x_dot, (0.0, dt), x,
-                        method = "DOP853", args = (t, u),
-                        rtol = rtol, atol = atol, t_eval = [dt])
+                        method  = "DOP853",
+                        args    = (t, u),
+                        rtol    = rtol,
+                        atol    = atol,
+                        t_eval  = [dt])
 
         if not sol.success:
             raise RuntimeError(f"Integration failed: {sol.message}")
@@ -219,7 +286,8 @@ class Plant:
 
         return x_next
 
-    # Implements RHS of x_dot = f(t, x)
+    # ── ODE RHS ─────────────────────────────────────────────────────────────
+
     def x_dot(self, tau, x, et0, u):
 
         xdot = np.zeros_like(x)
@@ -234,38 +302,48 @@ class Plant:
         #           o-+--+-o
         # ────────────────────────────────
         x_L         = x[self._slice_x(0, self.dim_x_sc)]
-        u_L         = u[self._slice_u(0, self.dim_u_sc)]
+        T_cmd_L     = u[self._slice_u(0, self.dim_u_sc)]
 
         r_L         = x_L[0:3]
         v_L         = x_L[3:6]
         q_L         = x_L[6:10]
         w_L         = x_L[10:13]
-        m_L         = x_L[13]
+        m_prop_L    = x_L[13]
 
-        a_ctrl_L    = u_L[0:3]
-        tau_ctrl_L  = u_L[3:6]
+        # Saturate thrust to physical range [0, T_max] N per thruster.
+        # The integrator may probe the RHS at small sub-steps; saturating here
+        # keeps the dynamics consistent with what the actuator can deliver.
+        T_L         = clamp_thrust(T_cmd_L, self.param.T_MAX)
 
-        # Spacecraft mass derivative (rocket equation)
-        m_dot_L     = self.mass_rhs(m_L, a_ctrl_L, self.param.Isp_L)
+        # Body-frame net force [N] and torque [N·m] from the allocation.
+        # If the propellant tank is dry, no actuator output is possible.
+        if m_prop_L <= 0.0:
+            T_L     = np.zeros_like(T_L)
+        F_B_L, tau_ctrl_L = force_torque_body(T_L)
 
-        # Time-varying inertia and its derivative
-        J_L         = self._J_current(m_L, self.param.m_cylinder_L,
-                                      self.param.J_cylinder_L,
-                                      self.param.J_ring_per_mass_L)
-        J_dot_L     = self.J_dot(m_dot_L, self.param.J_ring_per_mass_L)
+        # Rotate body-frame force to inertial frame and convert to acceleration.
+        # m_total is needed here, not m_prop.
+        # quat_to_CTM(q) returns C_I^B (inertial -> body); its transpose maps
+        # body -> inertial:   v^I = C_I^B.T @ v^B.
+        m_total_L   = self._m_total(m_prop_L, 'L')
+        F_I_L       = quat_to_CTM(q_L).T @ F_B_L                       # [N]
+        # a_ctrl in [km/s^2]:  (F[N] / m[kg]) * (1e-3 km/m)
+        a_ctrl_L    = (F_I_L / m_total_L) * self.param.KM_PER_M
 
-        # Absolute translational dynamics
+        # Absolute Translational Dynamics
         r_dot_L     = v_L
-        v_dot_L     = self.acc_rhs_abs(r_L, m_L, self.param.SRP_area_L, a_ctrl_L, et)
+        v_dot_L     = self.acc_rhs_abs(r_L, m_total_L, a_ctrl_L, 'L', et)
 
-        # Rotational kinematics
+        # Mass Derivative (Tsiolkovsky, per-thruster sum)
+        m_dot_L     = self.mass_rhs(m_prop_L, T_L, 'L')
+
+        # Rotational Kinematics + Dynamics
         q_dot_L     = self.attitude_kin_rhs(q_L, w_L)
+        w_dot_L     = self.attitude_dyn_rhs(w_L, m_prop_L, m_dot_L, tau_ctrl_L, 'L')
 
-        # Rotational dynamics
-        w_dot_L     = self.attitude_dyn_rhs(w_L, tau_ctrl_L, J_L, J_dot_L)
-
-        # Write
-        xdot[self._slice_x(0, self.dim_x_sc)] = np.concatenate([r_dot_L, v_dot_L, q_dot_L, w_dot_L, [m_dot_L]])
+        xdot[self._slice_x(0, self.dim_x_sc)] = np.concatenate(
+            [r_dot_L, v_dot_L, q_dot_L, w_dot_L, [m_dot_L]]
+        )
 
         # ── Follower Dynamics (i>0) ────
         #             ____
@@ -278,128 +356,135 @@ class Plant:
         for i in range(1, self.n_sc):
 
             x_i         = x[self._slice_x(i, self.dim_x_sc)]
-            u_i         = u[self._slice_u(i, self.dim_u_sc)]
+            T_cmd_i     = u[self._slice_u(i, self.dim_u_sc)]
 
-            dr_i        = x_i[0:3]      # δr w.r.t. Leader [km, ICRF]
-            dv_i        = x_i[3:6]      # δv w.r.t. Leader [km/s, ICRF]
+            delta_r     = x_i[0:3]
+            delta_v     = x_i[3:6]
             q_i         = x_i[6:10]
             w_i         = x_i[10:13]
-            m_i         = x_i[13]
+            m_prop_i    = x_i[13]
 
-            a_ctrl_i    = u_i[0:3]
-            tau_ctrl_i  = u_i[3:6]
+            T_i         = clamp_thrust(T_cmd_i, self.param.T_MAX)
+            if m_prop_i <= 0.0:
+                T_i     = np.zeros_like(T_i)
+            F_B_i, tau_ctrl_i = force_torque_body(T_i)
 
-            # Spacecraft mass derivative
-            m_dot_i     = self.mass_rhs(m_i, a_ctrl_i, self.param.Isp_F)
+            m_total_i   = self._m_total(m_prop_i, 'F')
+            F_I_i       = quat_to_CTM(q_i).T @ F_B_i                   # [N]
+            a_ctrl_i    = (F_I_i / m_total_i) * self.param.KM_PER_M
 
-            # Time-varying inertia and its derivative
-            J_i         = self._J_current(m_i, self.param.m_cylinder_F,
-                                          self.param.J_cylinder_F,
-                                          self.param.J_ring_per_mass_F)
-            J_dot_i     = self.J_dot(m_dot_i, self.param.J_ring_per_mass_F)
+            # Relative Translational Dynamics (numerically stable per-body diff)
+            r_dot_i     = delta_v
+            v_dot_i     = self.acc_rhs_rel(r_L, delta_r,
+                                           m_total_L, m_total_i,
+                                           a_ctrl_L, a_ctrl_i, et)
 
-            # Relative translational dynamics (numerically stable diff form)
-            dr_dot_i    = dv_i
-            dv_dot_i    = self.acc_rhs_rel(r_L, dr_i, m_L, m_i, a_ctrl_L, a_ctrl_i, et)
+            # Mass Derivative
+            m_dot_i     = self.mass_rhs(m_prop_i, T_i, 'F')
 
-            # Rotational kinematics (absolute attitude)
+            # Rotational Kinematics + Dynamics (attitude is absolute)
             q_dot_i     = self.attitude_kin_rhs(q_i, w_i)
-
-            # Rotational dynamics
-            w_dot_i     = self.attitude_dyn_rhs(w_i, tau_ctrl_i, J_i, J_dot_i)
+            w_dot_i     = self.attitude_dyn_rhs(w_i, m_prop_i, m_dot_i, tau_ctrl_i, 'F')
 
             xdot[self._slice_x(i, self.dim_x_sc)] = np.concatenate(
-                [dr_dot_i, dv_dot_i, q_dot_i, w_dot_i, [m_dot_i]]
+                [r_dot_i, v_dot_i, q_dot_i, w_dot_i, [m_dot_i]]
             )
 
         return xdot
 
-    # ── Translational acceleration ───────────────────────────────────────
+    # ── Translational dynamics ──────────────────────────────────────────────
 
-    def acc_rhs_abs(self, r_I, m, area, a_ctrl, et):
-        """
-        Total absolute acceleration on the Leader (ICRF) [km/s^2].
-        """
+    def acc_rhs_abs(self, r_I, m_total, a_ctrl, role, et):
+        """Total absolute acceleration on a spacecraft (used by leader).
+        `m_total` is the full spacecraft mass (cyl + ring_dry + prop) needed
+        by mass-dependent perturbations such as SRP.  `a_ctrl` is the
+        ALREADY-COMPUTED inertial-frame control acceleration produced by the
+        body-frame thrusters (see Plant.x_dot)."""
         a_tot = (self.acc_grav_abs(r_I, et)
-                 + self.acc_srp_abs(r_I, m, area, et)
+                 + self.acc_srp_abs(r_I, m_total, role, et)
                  + self.acc_grav_isc_abs()
                  + self.acc_ion_abs()
                  + self.acc_p_abs()
                  + a_ctrl)
         return a_tot
 
-    def acc_rhs_rel(self, r_L, dr, m_L, m_F, a_ctrl_L, a_ctrl_F, et):
+    def acc_rhs_rel(self, r_L, delta_r, m_total_L, m_total_F, a_ctrl_L, a_ctrl_F, et):
         """
-        Total differential acceleration of a Follower w.r.t. the Leader
-        (ICRF) [km/s^2]. Each contribution is formed at well-conditioned
-        scale (body-by-body for gravity; direct subtraction for SRP since
-        it's tiny in absolute magnitude).
+        Total DIFFERENTIAL acceleration on a follower w.r.t. the leader.
+        Each per-body subtraction is evaluated at well-conditioned scale to
+        avoid catastrophic cancellation when differencing SSB-scale vectors.
+        Both `m_total_L` and `m_total_F` are full spacecraft masses.
         """
-        a_tot = (self.acc_grav_rel(r_L, dr, et)
-                 + self.acc_srp_rel(r_L, dr, m_L, m_F, et)
-                 + self.acc_grav_isc_rel()
-                 + self.acc_ion_rel()
-                 + self.acc_p_rel()
-                 + (a_ctrl_F - a_ctrl_L))
-        return a_tot
+        da_tot = (self.acc_grav_rel(r_L, delta_r, et)
+                  + self.acc_srp_rel(r_L, delta_r, m_total_L, m_total_F, et)
+                  + self.acc_grav_isc_rel()
+                  + self.acc_ion_rel()
+                  + self.acc_p_rel()
+                  + (a_ctrl_F - a_ctrl_L))
+        return da_tot
 
     def acc_grav_abs(self, r_I, et):
-        """
-        N-body gravitational acceleration at absolute position r_I [km] in ICRF.
-        """
+        """N-body Solar System gravity at absolute r_I [km]. → [km/s^2]"""
         v_dot = np.zeros(3)
         for body, mu in self.env.GM.items():
-            r_b = self.env.body_position(body, et)
-            dr  = r_I - r_b
+            r_b   = self.env.body_position(body, et)
+            dr    = r_I - r_b
             v_dot -= mu * dr / np.linalg.norm(dr) ** 3
         return v_dot
 
-    def acc_grav_rel(self, r_L, dr, et):
+    def acc_grav_rel(self, r_L, delta_r, et):
         """
-        Differential N-body gravity on a Follower at r_F = r_L + δr,
-        computed body-by-body as
-
-            a_rel = Σ_b [ a_b(r_L + δr) - a_b(r_L) ]
-
-        with each per-body subtraction performed at well-conditioned scale
-        (d1 = r_L - r_b is reused; d2 = d1 + δr is never reconstructed from
-        SSB-relative absolutes).
+        Differential N-body gravity on follower at r_L + δr.  Evaluated as
+            Σ_b [ a_b(r_L + δr) − a_b(r_L) ]
+        with each term kept at body-relative scale (d2 = d1 + δr, never
+        d2 = r_F − r_b reconstructed from SSB-based absolutes).
         """
-        a = np.zeros(3)
+        da = np.zeros(3)
         for body, mu in self.env.GM.items():
             r_b = self.env.body_position(body, et)
-            d1  = r_L - r_b                  # body -> Leader
-            d2  = d1 + dr                    # body -> Follower
-            a  += -mu * (d2 / np.linalg.norm(d2) ** 3
-                       - d1 / np.linalg.norm(d1) ** 3)
-        return a
+            d1  = r_L - r_b                       # body → leader
+            d2  = d1 + delta_r                    # body → follower
+            da -= mu * (d2 / np.linalg.norm(d2) ** 3
+                      - d1 / np.linalg.norm(d1) ** 3)
+        return da
 
-    def acc_srp_abs(self, r_I, m, area, et):
+    def acc_srp_abs(self, r_I, m_total, role, et):
         """
-        Cannonball SRP at absolute position r_I, body of mass m, projected
-        area `area`, reflectivity self.param.c_reflect. [km/s^2 in ICRF]
+        Cannonball SRP at absolute position r_I; body of TOTAL mass `m_total`,
+        projected area A(role), reflectivity c_reflect.  → [km/s^2]
         """
+        if role == 'L':
+            A   = self.param.SRP_area_L
+        elif role == 'F':
+            A   = self.param.SRP_area_F
+        else: 
+            raise ValueError(f"Invalid role {role!r}: expected 'L' or 'F'")
+
+        c_R = self.param.c_reflect
+
         r_sun  = self.env.body_position("SUN", et)
         d      = r_I - r_sun
         d_norm = np.linalg.norm(d)
-        u_hat  = d / d_norm
-        P_at_r = self.param.P_SUN * (self.param.R_SUN_REF_KM / d_norm) ** 2
-        # 1e-3 converts m/s^2 -> km/s^2 (P in N/m^2 = kg/(m·s^2))
-        a_mag  = self.param.c_reflect * (area / m) * P_at_r * 1.0e-3
+        u_hat  = d / d_norm                                            # sun → s/c (outward)
+        P_at_r = self.param.P_SUN * (self.param.R_SUN_AU / d_norm) ** 2
+        a_mag  = c_R * (A / m_total) * P_at_r * self.param.KM_PER_M
         return a_mag * u_hat
 
-    def acc_srp_rel(self, r_L, dr, m_L, m_F, et):
+    def acc_srp_rel(self, r_L, delta_r, m_total_L, m_total_F, et):
         """
-        Differential cannonball SRP: a_srp(Follower) - a_srp(Leader).
-        SRP at 1 AU is ~1e-13 km/s^2 — the literal difference is fine
-        numerically (no large-number cancellation).
+        Differential cannonball SRP: SRP(follower) − SRP(leader).
+        Done as a literal difference of two SRP evaluations — safe because
+        SRP itself is tiny (~1e-13 km/s^2), no large-number cancellation.
+        Two physical sources of mismatch:
+          (i)  position-dependent (1/r^2, sun-line) — ~|δr|/AU of nominal
+          (ii) parameter-dependent (m, A may differ between leader/follower)
         """
-        a_F = self.acc_srp_abs(r_L + dr, m_F, self.param.SRP_area_F, et)
-        a_L = self.acc_srp_abs(r_L,      m_L, self.param.SRP_area_L, et)
+        a_F = self.acc_srp_abs(r_L + delta_r, m_total_F, 'F', et)
+        a_L = self.acc_srp_abs(r_L,           m_total_L, 'L', et)
         return a_F - a_L
 
     def acc_grav_isc_abs(self):
-        # TODO: inter-spacecraft gravity (currently negligible)
+        # TODO: inter-spacecraft gravity (negligible at 100 m, 3000 kg)
         return np.zeros(3)
 
     def acc_grav_isc_rel(self):
@@ -407,7 +492,7 @@ class Plant:
         return np.zeros(3)
 
     def acc_ion_abs(self):
-        # TODO: ion engine continuous thrust (off)
+        # TODO: continuous ion thrust (separate from a_ctrl chemical impulse)
         return np.zeros(3)
 
     def acc_ion_rel(self):
@@ -415,87 +500,128 @@ class Plant:
         return np.zeros(3)
 
     def acc_p_abs(self):
-        # TODO: stochastic process noise (off)
+        # TODO: process noise
         return np.zeros(3)
 
     def acc_p_rel(self):
         # TODO
         return np.zeros(3)
 
-    # ── Attitude ─────────────────────────────────────────────────────────
+    # ── Rotational dynamics ─────────────────────────────────────────────────
 
     def attitude_kin_rhs(self, q, omega):
-        """
-        Quaternion kinematics: q_dot = (1/2) Ω(ω) q.
-        """
+        """Quaternion kinematics: q̇ = ½ Ω(ω) q."""
         return 0.5 * Omega_omega(omega) @ q
 
-    def attitude_dyn_rhs(self, omega, tau_ctrl, J, J_dot):
+    def attitude_dyn_rhs(self, omega, m_prop, m_dot, tau_ctrl, role):
         """
-        Rigid-body rotational dynamics in body frame with time-varying inertia:
+        Euler's rotational equation with a TIME-VARYING inertia:
+            J(m_prop) ω̇  =  τ_SRP + τ_p + τ_ctrl  −  ω × (J ω)  −  J̇ ω
 
-            J ω̇ = τ_ctrl + τ_SRP + τ_p − ω × (J ω) − J̇ ω
-
-        Solve for ω̇. `J` and `J_dot` are passed in because they depend on the
-        current (time-varying) mass of the spacecraft.
+        J(m_prop) = J_cyl(role) + (m_ring_dry(role) + m_prop) · K_ring
+        J̇         = ṁ_prop · K_ring
+                    (cylinder and dry ring are constant — only the propellant
+                     mass varies — so the time-derivative comes from that term)
+        `m_dot` here is the time-derivative of the propellant mass (= state's
+        m index), which equals the total mass time-derivative.
         """
-        tau_tot = (tau_ctrl
-                   + self.attitude_tau_SRP()
+        J     = self._inertia_now(m_prop, role)
+        J_dot = self._inertia_dot_now(m_dot)
+        J_inv = np.linalg.inv(J)
+
+        tau_tot = (self.attitude_tau_SRP()
                    + self.attitude_tau_p()
+                   + tau_ctrl
                    - np.cross(omega, J @ omega)
                    - J_dot @ omega)
-        return np.linalg.solve(J, tau_tot)
+
+        return J_inv @ tau_tot
 
     def attitude_tau_SRP(self):
-        # TODO: SRP torque (cp offset etc.) — currently zero
+        # TODO: SRP torque (depends on attitude and CoP offset)
         return np.zeros(3)
 
     def attitude_tau_p(self):
-        # TODO: stochastic torque disturbance — currently zero
+        # TODO: process-noise torque
         return np.zeros(3)
 
-    # ── Mass & inertia derivatives ───────────────────────────────────────
+    # ── Mass dynamics ───────────────────────────────────────────────────────
 
-    def mass_rhs(self, m, a_ctrl, Isp):
+    def mass_rhs(self, m_prop, T_cmd, role):
         """
-        Rocket-equation mass flow from commanded thrust acceleration.
+        Per-thruster Tsiolkovsky mass flow, matching design-doc eq. (25):
 
-            |T| = m · |a_ctrl|              (Newton's 2nd law)
-            ṁ   = − |T| / (Isp · g_0)       (rocket equation)
+            ṁ_prop = - (Σ_l T_l) / (Isp · g0)
 
-        Units are consistent in km: |a_ctrl| [km/s^2], g_0 [km/s^2],
-        Isp [s] → ṁ [kg/s].
+        with `T_cmd` in newtons (already clamped to [0, T_max] by the caller).
+        Each thruster's individual magnitude contributes additively — this
+        correctly captures the propellant cost of opposing thruster firings
+        used for torque generation.
+
+        Unit handling (km / s / kg system):
+            T_l       [N] = [kg·m/s²]              ← convert N → kN to match
+            Isp · g0  [s · km/s²] = [km/s]
+            ṁ        [kg/s]
+        We do the N→kN conversion explicitly so the formula reads cleanly.
+
+        When the propellant tank is empty, ṁ = 0 by clamping; the caller
+        should also zero the thrust command (which it does in `x_dot`).
         """
-        thrust_mag = m * np.linalg.norm(a_ctrl)         # [kg · km/s^2]
-        return -thrust_mag / (Isp * self.param.G_0)     # [kg/s]
+        if m_prop <= 0.0:
+            return 0.0
 
-    def J_dot(self, m_dot, J_ring_per_mass):
+        if role == 'L':
+            Isp = self.param.ISP_L
+        elif role == 'F':
+            Isp = self.param.ISP_F
+        else:
+            raise ValueError(f"Invalid role {role!r}: expected 'L' or 'F'")
+
+        # Σ |T_l| in newtons → kN
+        T_sum_kN = float(np.sum(T_cmd)) / self.param.N_PER_KN
+        return - T_sum_kN / (Isp * self.param.G0)
+
+    # ── Mass / inertia helpers ──────────────────────────────────────────────
+
+    def _m_total(self, m_prop, role):
+        """Total spacecraft mass = m_cyl + m_ring_dry + m_prop."""
+        if role == 'L':
+            return self.param.m_cylinder_L + self.param.m_ring_dry_L + max(m_prop, 0.0)
+        elif role == 'F':
+            return self.param.m_cylinder_F + self.param.m_ring_dry_F + max(m_prop, 0.0)
+        else:
+            raise ValueError(f"Invalid role {role!r}: expected 'L' or 'F'")
+
+    def _inertia_now(self, m_prop, role):
         """
-        Inertia tensor time derivative.
-
-        Per the design doc (Eq. 23–24) the RING is the fuel-bearing section, so
-        its mass m_r,i = m_i − m_c,i varies in time while the cylindrical bus
-        mass m_c,i is constant. J_ring scales linearly with m_ring for fixed
-        ring geometry:
-
-            J_ring(t) = m_r,i(t) · J_ring_per_mass
-            ⇒  J̇    = ṁ_r,i · J_ring_per_mass = ṁ_i · J_ring_per_mass
-
-        (m_cylinder is constant, so ṁ_r,i = ṁ_i = ṁ.)
+        Current J_B(m_prop) for the given role.
+        J = (m_ring_dry + m_prop) · K_ring + J_cyl
+        Propellant occupies the same annular envelope as the dry ring, so the
+        same K_ring multiplies the combined ring mass.
         """
-        return m_dot * J_ring_per_mass
+        if role == 'L':
+            m_ring_dry, J_cyl = self.param.m_ring_dry_L, self.param.J_cylinder_L
+        elif role == 'F':
+            m_ring_dry, J_cyl = self.param.m_ring_dry_F, self.param.J_cylinder_F
+        else:
+            raise ValueError(f"Invalid role {role!r}: expected 'L' or 'F'")
 
-    @staticmethod
-    def _J_current(m, m_cylinder, J_cylinder, J_ring_per_mass):
+        m_ring = m_ring_dry + max(m_prop, 0.0)
+        return inertia(m_ring, self.param.r_in, self.param.r_out,
+                       self.param.h_ring, J_cyl, self.param.off_diag_frac, 
+                       self.param.OFF_xy, self.param.OFF_xz, self.param.OFF_yz)
+
+    def _inertia_dot_now(self, m_dot):
         """
-        Reconstruct the current total inertia from the current total mass:
-
-            m_r,i(t) = m(t) − m_cylinder          (constant bus mass)
-            J(t)     = J_cylinder + m_r,i(t) · J_ring_per_mass
+        dJ/dt. Cylinder mass and dry-ring mass are constant ⇒ only the
+        propellant contributes. J_ring is linear in (m_ring_dry + m_prop),
+        so dJ/dt = ṁ_prop · K_ring. Geometry (r_in, r_out, h_ring) is
+        shared between leader and follower, so no role dispatch is needed.
         """
-        return J_cylinder + (m - m_cylinder) * J_ring_per_mass
+        return inertia_dot(m_dot, self.param.r_in, self.param.r_out, self.param.h_ring, self.param.off_diag_frac, 
+                       self.param.OFF_xy, self.param.OFF_xz, self.param.OFF_yz)
 
-    # ── Utilities ────────────────────────────────────────────────────────
+    # ── Slicing / quaternion utilities ──────────────────────────────────────
 
     @staticmethod
     def _renormalize_quat(x_next, n_sc, dim_x_sc):
@@ -519,45 +645,63 @@ class Plant:
 # Methods
 ##############################################
 
+def _K_ring(r_in, r_out, h_ring, off_diag_frac, OFF_xy, OFF_xz, OFF_yz) -> np.ndarray:
+    """
+    Geometric inertia coefficient of the ring per unit mass [m^2].
+    J_ring(m_ring) = m_ring * K_ring   (linear in m_ring)
 
-def inertia_ring(m_ring, r_in, r_out, h_ring) -> np.ndarray:
-    """Hollow-cylindrical-ring (annular cylinder) inertia tensor."""
-    J = np.zeros((3, 3))
-    J[0, 0] = (1/12) * m_ring * (3 * (r_in**2 + r_out**2) + h_ring**2)
-    J[1, 1] = J[0, 0]
-    J[2, 2] = (1/2)  * m_ring * (r_in**2 + r_out**2)
-    return J
+    The diagonals are the standard hollow-cylinder formulas. The off-diagonals
+    are a small symmetry-breaking perturbation expressed as a fraction of the
+    largest diagonal — they have no physical derivation but make the inertia
+    tensor non-principal, which exercises the full ω × (Jω) coupling. Set
+    off_diag_frac = 0.0 to recover the strictly diagonal model.
+    """
+    K = np.zeros((3, 3))
+    K[0, 0] = (1/12) * (3 * (r_in**2 + r_out**2) + h_ring**2)
+    K[1, 1] = K[0, 0]
+    K[2, 2] = (1/2)  * (r_in**2 + r_out**2)
+
+    # Symmetric off-diagonal perturbation.
+    eps = off_diag_frac
+    if OFF_xy == True:
+        K[0, 1] = K[1, 0] = eps
+    if OFF_xz == True:
+        K[0, 2] = K[2, 0] = eps
+    if OFF_yz == True:
+        K[1, 2] = K[2, 1] = eps
+
+    return K
 
 
+def inertia(m_ring, r_in, r_out, h_ring, J_cylinder, off_diag_frac, OFF_xy, OFF_xz, OFF_yz) -> np.ndarray:
+    """Total J = m_ring * K_ring + J_cylinder."""
+    return m_ring * _K_ring(r_in, r_out, h_ring, off_diag_frac, OFF_xy, OFF_xz, OFF_yz) + J_cylinder
+
+
+def inertia_dot(m_dot, r_in, r_out, h_ring, off_diag_frac, OFF_xy, OFF_xz, OFF_yz) -> np.ndarray:
+    """dJ/dt = ṁ_ring * K_ring   (cylinder is constant)."""
+    return m_dot * _K_ring(r_in, r_out, h_ring, off_diag_frac, OFF_xy, OFF_xz, OFF_yz)
+
+
+# Inertia tensor of the constant-mass inner cylinder (z = symmetry axis).
 def inertia_cylinder(m_cylinder, r_cylinder, h_cylinder) -> np.ndarray:
-    """Solid cylinder inertia tensor about its principal axes."""
-    J = np.zeros((3, 3))
-    J[0, 0] = (1/12) * m_cylinder * (3 * r_cylinder**2 + h_cylinder**2)
-    J[1, 1] = J[0, 0]
-    J[2, 2] = (1/2)  * m_cylinder * r_cylinder**2
-    return J
+    J_cylinder         = np.zeros((3, 3))
+    J_cylinder[0, 0]   = (1/12) * m_cylinder * (3 * r_cylinder**2 + h_cylinder**2)
+    J_cylinder[1, 1]   = J_cylinder[0, 0]
+    J_cylinder[2, 2]   = (1/2)  * m_cylinder * r_cylinder**2
+    return J_cylinder
 
 
-def inertia(m_ring, r_in, r_out, h_ring, J_cylinder) -> np.ndarray:
-    """Combined ring + cylinder inertia tensor."""
-    return inertia_ring(m_ring, r_in, r_out, h_ring) + J_cylinder
-
-
-def mass_ring(m_init, m_cylinder):
-    return m_init - m_cylinder
-
-
-def initialize_state(formation, baseline, att_F, m_init_F, x_init_L, n_sc):
-    """Build the stacked initial state. Followers are stored in RELATIVE form
-    (δr, δv) w.r.t. the Leader."""
+# Initialize the stacked state vector for leader + followers.
+def initialize_state(formation, baseline, att_F, m_prop_init_F, x_init_L, n_sc):
 
     if formation == "square planar" and att_F == "same as leader" and n_sc == 5:
 
         delta_r0_list = [
-            np.array([ baseline,  0.0,     0.0]),   # follower_1: +x
-            np.array([-baseline,  0.0,     0.0]),   # follower_2: -x
-            np.array([ 0.0,       baseline, 0.0]),  # follower_3: +y
-            np.array([ 0.0,      -baseline, 0.0]),  # follower_4: -y
+            np.array([ baseline,  0.0,      0.0]),   # follower_1: +x
+            np.array([-baseline,  0.0,      0.0]),   # follower_2: -x
+            np.array([ 0.0,       baseline, 0.0]),   # follower_3: +y
+            np.array([ 0.0,      -baseline, 0.0]),   # follower_4: -y
         ]
 
         q_init_F = np.array([1.0, 0.0, 0.0, 0.0])
@@ -566,16 +710,24 @@ def initialize_state(formation, baseline, att_F, m_init_F, x_init_L, n_sc):
         x0 = [x_init_L]
         for dr0 in delta_r0_list:
             dv0 = np.zeros(3)
-            x0.append(np.concatenate([dr0, dv0, q_init_F, w_init_F, [m_init_F]]))
+            x0.append(np.concatenate([dr0, dv0, q_init_F, w_init_F, [m_prop_init_F]]))
         x = np.concatenate(x0)
 
     else:
         raise NotImplementedError(
-            "Formation geometry or attitude initialization not implemented "
-            "for the given parameters."
+            "Formation geometry or attitude initialization not implemented."
         )
 
     return x
+
+
+# Build the per-spacecraft list of label/J_B namespaces consumed by the
+# plotting layer (kept minimal — only the two attributes the plots use).
+def build_plot_spacecraft(param, n_sc):
+    sc = [SimpleNamespace(label="leader", J_B=param.J_init_L)]
+    for i in range(1, n_sc):
+        sc.append(SimpleNamespace(label=f"follower_{i}", J_B=param.J_init_F))
+    return sc
 
 
 ##############################################
@@ -584,82 +736,80 @@ def initialize_state(formation, baseline, att_F, m_init_F, x_init_L, n_sc):
 
 def main():
 
-    # Load SPICE kernels into environment
-    env = SpiceEnv(KERNELS, BODIES, FRAME, ABCORR, OBSERVER)
-
-    # Load Spacecraft Parameters and Constants
+    # ─── Environment + Parameters ────────────────────────────────────
+    env   = SpiceEnv(KERNELS, BODIES, FRAME, ABCORR, OBSERVER)
     param = Parameters()
 
-    # ---------------------------------------
-    # MODEL Settings:
+    # ─── MODEL Settings ──────────────────────────────────────────────
+    # n_sc = 1 leader + (n_sc − 1) followers
+    n_sc       = 5
 
-    # Number of spacecrafts ( n_sc = (1 Leader) + (n_sc - 1 Followers) )
-    n_sc = 5
+    # State / measurement / control dimensions
+    dim_x_sc   = 14                  # [x,y,z, vx,vy,vz, q0..q3, wx,wy,wz, m_prop]
+    dim_y_sc   = dim_x_sc            # same for now
+    dim_u_sc   = N_THRUSTERS         # = 20: per-thruster thrust magnitudes [N]
 
-    # State space dimensions
-    dim_x_sc = 14           # [x, y, z, vx, vy, vz, q1, q2, q3, q4, wx, wy, wz, m]
-    dim_y_sc = dim_x_sc     # same for now
-    dim_u_sc = 6            # [fx, fy, fz, taux, tauy, tauz]
+    dim_x      = n_sc * dim_x_sc
+    dim_y      = n_sc * dim_y_sc
+    dim_u      = n_sc * dim_u_sc
 
-    dim_x = n_sc * dim_x_sc
-    dim_y = n_sc * dim_y_sc
-    dim_u = n_sc * dim_u_sc
+    # ─── Pipeline classes ────────────────────────────────────────────
+    sensor     = Sensor()
+    ctrl       = Controller(dim_u)
+    guidance   = Guidance(dim_y)
+    plant      = Plant(env, param, n_sc, dim_x_sc, dim_u_sc)
 
-    # Initialize the Classes
-    sensor      = Sensor()
-    ctrl        = Controller(dim_u)
-    guidance    = Guidance(dim_y)
-    plant       = Plant(env, param, n_sc, dim_x_sc, dim_u_sc)
+    # ─── SIMULATION Parameters ───────────────────────────────────────
+    et_init    = env.str2et("2026-05-12T00:00:00")
 
-    # ---------------------------------------
-    # SIMULATION Parameters:
+    # Leader Initial State (r0, v0, q0, w0, m_prop0)  — Webb-like halo about L2
+    r_init_L   = np.array([-9.594503991242750e7, -1.098032827423822e8, -4.778858640538428e7])   # [km]
+    v_init_L   = np.array([ 2.279303677102495e1, -1.735582913273474e1, -7.640659579588683e0])   # [km/s]
+    q_init_L   = np.array([1.0, 0.0, 0.0, 0.0])
+    w_init_L   = np.array([0.0, 0.0, 0.0])
+    x_init_L   = np.concatenate((r_init_L, v_init_L, q_init_L, w_init_L,
+                                 [param.m_prop_init_L]))
 
-    # Initial Epoch (ET)
-    et_init     = env.str2et("2026-05-12T00:00:00")
+    # Initial formation
+    formation  = "square planar"
+    baseline   = 0.1                       # 100 m
+    att_F      = "same as leader"
 
-    # Leader Initial State (r0, v0, q0, w0, m0) — Webb-like halo around L2
-    r_init_L    = np.array([-9.594503991242750e7, -1.098032827423822e8, -4.778858640538428e7])   # [km]
-    v_init_L    = np.array([ 2.279303677102495e1, -1.735582913273474e1, -7.640659579588683e0])   # [km/s]
-    q_init_L    = np.array([1.0, 0.0, 0.0, 0.0])
-    w_init_L    = np.array([0.001, 0.01, 0.0])     # [rad/s]
-    x_init_L    = np.concatenate((r_init_L, v_init_L, q_init_L, w_init_L,
-                                  [param.m_init_L]))
+    x_init     = initialize_state(formation, baseline, att_F,
+                                  param.m_prop_init_F, x_init_L, n_sc)
 
-    # Initial Formation
-    formation   = "square planar"
-    baseline    = 0.1                # [km] — 100 m
-    att_F       = "same as leader"
-
-    x_init = initialize_state(formation, baseline, att_F,
-                              param.m_init_F, x_init_L, n_sc)
-
-    # ── Initial-state printout ──────────────────────────────────────────
+    # ─── Initial-state printout ──────────────────────────────────────
     print(f"\nEpoch  : {env.et2utc(et_init)}")
-    print(f"n_sc   : {n_sc}  (1 leader + {n_sc - 1} followers)")
-    print(f"Leader r0 : {x_init[0:3]}  km")
-    print(f"Leader v0 : {x_init[3:6]}  km/s")
-    print(f"Leader m0 : {x_init[13]}  kg")
-    print(f"Initial follower baselines [m]:")
+    print(f"N_SC   : {n_sc} (1 leader + {n_sc - 1} followers)")
+    print(f"Leader r0       : {x_init[0:3]}  km")
+    print(f"Leader v0       : {x_init[3:6]}  km/s")
+    print(f"Leader m_prop0  : {x_init[13]:.3f} kg  "
+          f"(total mass {param.m_init_L:.1f} kg = {param.m_cylinder_L:.0f} cyl "
+          f"+ {param.m_ring_dry_L:.0f} ring_dry + {param.m_prop_init_L:.0f} prop)")
+    print(f"T_max / thruster: {param.T_MAX:.1f} N  "
+          f"({N_THRUSTERS} thrusters → max body-frame |F| ≈ "
+          f"{param.T_MAX * np.linalg.norm(B_F, ord=2):.1f} N if all parallel)")
+    print("Baselines (initial, [m]):")
     for i in range(1, n_sc):
-        dr_m = np.linalg.norm(x_init[dim_x_sc * i : dim_x_sc * i + 3]) * 1e3
+        dr_m = np.linalg.norm(x_init[dim_x_sc*i : dim_x_sc*i + 3]) * 1e3
         print(f"  follower_{i}: |δr0| = {dr_m:.3f} m")
 
-    # ---------------------------------------
-    # Time loop
-    dt          = 200.0           # [s]
-    t_tot       = 3 * 86400       # [s]
+    # ─── Time grid + history buffers ─────────────────────────────────
+    dt          = 10.0
+    t_tot       = 0.05 * 86400
     n_steps     = int(t_tot / dt)
-    et          = et_init
-    x           = x_init
+    print_every = max(1, n_steps // 20)
 
-    t_hist        = np.zeros(n_steps + 1)
-    X_hist        = np.zeros((n_steps + 1, dim_x))
-    X_hist[0, :]  = x
-    print_every   = max(1, n_steps // 20)
+    t_hist          = np.zeros(n_steps + 1)
+    X_hist          = np.zeros((n_steps + 1, dim_x))
+    X_hist[0, :]    = x_init
 
     print(f"\n--- Epoch-stepping simulation: {n_steps} steps of {dt:.1f} s "
           f"({n_steps * dt / 3600:.2f} h total) ---")
 
+    # ─── Main control loop ───────────────────────────────────────────
+    et = et_init
+    x  = x_init
     for k in range(n_steps):
 
         # ------------  Sense ----------- #
@@ -668,38 +818,45 @@ def main():
         # ------------  Plan  ----------- #
         y_ref   = guidance.reference(et)
         u       = ctrl.compute(y_hat, y_ref, et)
+        # Quick manual test: fire thruster #6 (-x face of -x cube) on the
+        # leader at 1 N → continuous +x body-frame thrust of 1 N.  Uncomment
+        # to exercise the new actuator path.
+        u[0] = 1.0    # leader thruster index 6 (0-based: 5)
+        # u[2] = 1.0
+        # u[6] = 1.0
+        # u[7] = 1.0
 
         # ------------   Act  ----------- #
         x_next  = plant.step(x, u, et, dt)
 
         # ------------  Data  ----------- #
-        t_hist[k + 1]     = (k + 1) * dt
-        X_hist[k + 1, :]  = x_next
+        t_hist[k + 1]    = (k + 1) * dt
+        X_hist[k + 1, :] = x_next
 
         if (k + 1) % print_every == 0 or k == n_steps - 1:
-            dr1_m = np.linalg.norm(x_next[dim_x_sc : dim_x_sc + 3]) * 1e3
+            dr1_m   = np.linalg.norm(x_next[dim_x_sc : dim_x_sc + 3]) * 1e3
+            mprop_L = x_next[13]
             print(
                 f"  k={k+1:5d}/{n_steps}  t={(k+1)*dt/3600:6.3f} h   "
                 f"|r_L|={np.linalg.norm(x_next[0:3]):.6e} km   "
                 f"|q_L|={np.linalg.norm(x_next[6:10]):.12f}   "
-                f"|δr_1|={dr1_m:.6f} m"
+                f"|δr_1|={dr1_m:.6f} m   "
+                f"m_prop_L={mprop_L:.4f} kg"
             )
 
         x   = x_next
         et += dt
 
-    # ── Per-follower diagnostic dump ────────────────────────────────────
-    labels = ["leader"] + [f"follower_{i}" for i in range(1, n_sc)]
-
+    # ─── Per-follower diagnostic dump ────────────────────────────────
     print("\n--- Final baselines and drift over the run ---")
     for i in range(1, n_sc):
-        dr_init  = X_hist[0,  dim_x_sc * i : dim_x_sc * i + 3]
-        dr_final = X_hist[-1, dim_x_sc * i : dim_x_sc * i + 3]
-        mag_init   = np.linalg.norm(dr_init)  * 1e3   # m
-        mag_final  = np.linalg.norm(dr_final) * 1e3   # m
-        drift      = mag_final - mag_init             # m  (signed)
+        dr_init   = X_hist[0,  dim_x_sc*i : dim_x_sc*i + 3]
+        dr_final  = X_hist[-1, dim_x_sc*i : dim_x_sc*i + 3]
+        mag_init  = np.linalg.norm(dr_init)  * 1e3
+        mag_final = np.linalg.norm(dr_final) * 1e3
+        drift     = mag_final - mag_init
         print(
-            f"  {labels[i]:<11s} "
+            f"  follower_{i:<2d} "
             f"|δr0| = {mag_init:.6f} m   "
             f"|δr(T)| = {mag_final:.9f} m   "
             f"Δ|δr| = {drift*1e6:+.3f} μm   "
@@ -707,45 +864,42 @@ def main():
             f"{dr_final[2]*1e3:+.6f}] m"
         )
 
-    # ── Pairwise follower trajectory differences ────────────────────────
+    # ─── Pairwise follower comparison ────────────────────────────────
     print("\n--- Pairwise follower-trajectory differences over full run ---")
     for i in range(1, n_sc):
         for j in range(i + 1, n_sc):
-            dr_i = X_hist[:, dim_x_sc * i : dim_x_sc * i + 3]
-            dr_j = X_hist[:, dim_x_sc * j : dim_x_sc * j + 3]
+            dr_i     = X_hist[:, dim_x_sc*i : dim_x_sc*i + 3]
+            dr_j     = X_hist[:, dim_x_sc*j : dim_x_sc*j + 3]
             diff_mag = np.max(np.abs(np.linalg.norm(dr_i, axis=1)
                                      - np.linalg.norm(dr_j, axis=1))) * 1e3
             diff_vec = np.max(np.linalg.norm(dr_i - dr_j, axis=1)) * 1e3
             print(
-                f"  {labels[i]} vs {labels[j]}: "
+                f"  follower_{i} vs follower_{j}: "
                 f"max ||δr_i| - |δr_j|| = {diff_mag:.3e} m, "
                 f"max |δr_i - δr_j| = {diff_vec:.3e} m"
             )
 
-    # ── Plots ───────────────────────────────────────────────────────────
-    # Plotting utilities from main.py expect a list of objects with `.label`.
-    # Wrap our flat label list in SimpleNamespace so they still work.
-    spacecraft_for_plot = [SimpleNamespace(label=l) for l in labels]
-
+    # ─── Plots ───────────────────────────────────────────────────────
     print("\nGenerating plots ...")
+    spacecraft = build_plot_spacecraft(param, n_sc)
     plot_trajectory(
         t_hist     = t_hist,
         X_hist     = X_hist,
         et0        = et_init,
-        spacecraft = spacecraft_for_plot,
+        spacecraft = spacecraft,
     )
     plot_solar_system(
         et0        = et_init,
         duration   = t_hist[-1],
         X_hist     = X_hist,
         t_hist     = t_hist,
-        spacecraft = spacecraft_for_plot,
+        spacecraft = spacecraft,
     )
     plot_l2_rotating_frame_zoom(
         et0        = et_init,
         t_hist     = t_hist,
         X_hist     = X_hist,
-        spacecraft = spacecraft_for_plot,
+        spacecraft = spacecraft,
     )
 
 

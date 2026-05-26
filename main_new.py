@@ -32,6 +32,13 @@ from types import SimpleNamespace
 # File Imports
 from config.mission.config import KERNELS, BODIES, FRAME, ABCORR, OBSERVER
 from utils.other.Omega_omega import Omega_omega
+from utils.coordinate_trafos.CTM_to_Euler import CTM_to_euler
+from utils.coordinate_trafos.CTM_to_Quat import CTM_to_quat
+from utils.coordinate_trafos.Euler_to_CTM import euler_to_CTM
+from utils.coordinate_trafos.Euler_to_Quat import euler_to_quat
+from utils.coordinate_trafos.Quat_to_CTM import quat_to_CTM
+from utils.coordinate_trafos.Quat_to_Euler import quat_to_euler
+ 
 from utils.plotting.plotting import (
     plot_trajectory,
     plot_solar_system,
@@ -365,7 +372,13 @@ class Plant:
         Cannonball SRP at absolute position r_I; body of mass m, projected
         area A(role), reflectivity c_reflect.  → [km/s^2]
         """
-        A   = self.param.SRP_area_L if role == 'L' else self.param.SRP_area_F
+        if role == 'L':
+            A   = self.param.SRP_area_L
+        elif role == 'F':
+            A   = self.param.SRP_area_F
+        else: 
+            raise ValueError(f"Invalid role {role!r}: expected 'L' or 'F'")
+
         c_R = self.param.c_reflect
 
         r_sun  = self.env.body_position("SUN", et)
@@ -464,7 +477,13 @@ class Plant:
         The scalar m carried in the state IS the total mass m_cyl + m_ring,
         and since m_cyl is constant, ṁ = ṁ_ring.
         """
-        Isp   = self.param.ISP_L if role == 'L' else self.param.ISP_F
+        if role == 'L':
+            Isp   = self.param.ISP_L
+        elif role == 'F':
+            Isp   = self.param.ISP_F
+        else: 
+            raise ValueError(f"Invalid role {role!r}: expected 'L' or 'F'")
+
         F_mag = m * np.linalg.norm(a_ctrl)
         return -F_mag / (Isp * self.param.G0)
 
@@ -474,8 +493,11 @@ class Plant:
         """Current J_B(m) for the given role (cylinder + ring(m − m_cyl))."""
         if role == 'L':
             m_cyl, J_cyl = self.param.m_cylinder_L, self.param.J_cylinder_L
-        else:
+        elif role == 'F':
             m_cyl, J_cyl = self.param.m_cylinder_F, self.param.J_cylinder_F
+        else: 
+            raise ValueError(f"Invalid role {role!r}: expected 'L' or 'F'")
+
         m_ring = m - m_cyl
         return inertia(m_ring, self.param.r_in, self.param.r_out,
                        self.param.h_ring, J_cyl)
@@ -514,22 +536,38 @@ class Plant:
 # Methods
 ##############################################
 
-# Total inertia tensor: outer annular ring (variable mass) + inner solid cylinder.
+def _K_ring(r_in, r_out, h_ring, off_diag_frac=1e-4) -> np.ndarray:
+    """
+    Geometric inertia coefficient of the ring per unit mass [m^2].
+    J_ring(m_ring) = m_ring * K_ring   (linear in m_ring)
+
+    The diagonals are the standard hollow-cylinder formulas. The off-diagonals
+    are a small symmetry-breaking perturbation expressed as a fraction of the
+    largest diagonal — they have no physical derivation but make the inertia
+    tensor non-principal, which exercises the full ω × (Jω) coupling. Set
+    off_diag_frac = 0.0 to recover the strictly diagonal model.
+    """
+    K = np.zeros((3, 3))
+    K[0, 0] = (1/12) * (3 * (r_in**2 + r_out**2) + h_ring**2)
+    K[1, 1] = K[0, 0]
+    K[2, 2] = (1/2)  * (r_in**2 + r_out**2)
+
+    # Symmetric off-diagonal perturbation, scaled to the largest diagonal.
+    eps = off_diag_frac * K[2, 2]
+    K[0, 1] = K[1, 0] = 0
+    K[0, 2] = K[2, 0] = 0
+    K[1, 2] = K[2, 1] = eps
+    return K
+
+
 def inertia(m_ring, r_in, r_out, h_ring, J_cylinder) -> np.ndarray:
-    J_ring        = np.zeros((3, 3))
-    J_ring[0, 0]  = (1/12) * m_ring * (3 * (r_in**2 + r_out**2) + h_ring**2)
-    J_ring[1, 1]  = J_ring[0, 0]
-    J_ring[2, 2]  = (1/2)  * m_ring * (r_in**2 + r_out**2)
-    return J_ring + J_cylinder
+    """Total J = m_ring * K_ring + J_cylinder."""
+    return m_ring * _K_ring(r_in, r_out, h_ring) + J_cylinder
 
 
-# Time derivative of total inertia: only the ring's mass changes with burn.
 def inertia_dot(m_dot, r_in, r_out, h_ring) -> np.ndarray:
-    J_dot        = np.zeros((3, 3))
-    J_dot[0, 0]  = (1/12) * m_dot * (3 * (r_in**2 + r_out**2) + h_ring**2)
-    J_dot[1, 1]  = J_dot[0, 0]
-    J_dot[2, 2]  = (1/2)  * m_dot * (r_in**2 + r_out**2)
-    return J_dot
+    """dJ/dt = ṁ_ring * K_ring   (cylinder is constant)."""
+    return m_dot * _K_ring(r_in, r_out, h_ring)
 
 
 # Inertia tensor of the constant-mass inner cylinder (z = symmetry axis).
@@ -599,9 +637,9 @@ def main():
     n_sc       = 5
 
     # State / measurement / control dimensions
-    dim_x_sc   = 14       # [x, y, z, vx, vy, vz, q0, q1, q2, q3, wx, wy, wz, m]
-    dim_y_sc   = dim_x_sc # same for now
-    dim_u_sc   = 6        # [ax, ay, az, taux, tauy, tauz]
+    dim_x_sc   = 14             # [x, y, z, vx, vy, vz, q0, q1, q2, q3, wx, wy, wz, m]
+    dim_y_sc   = dim_x_sc       # same for now
+    dim_u_sc   = 6              # [ax, ay, az, taux, tauy, tauz]
 
     dim_x      = n_sc * dim_x_sc
     dim_y      = n_sc * dim_y_sc
@@ -643,8 +681,8 @@ def main():
         print(f"  follower_{i}: |δr0| = {dr_m:.3f} m")
 
     # ─── Time grid + history buffers ─────────────────────────────────
-    dt          = 200.0
-    t_tot       = 3 * 86400
+    dt          = 100.0
+    t_tot       = 0.05 * 86400
     n_steps     = int(t_tot / dt)
     print_every = max(1, n_steps // 20)
 
@@ -666,6 +704,7 @@ def main():
         # ------------  Plan  ----------- #
         y_ref   = guidance.reference(et)
         u       = ctrl.compute(y_hat, y_ref, et)
+        u[0]    = 1e-7
 
         # ------------   Act  ----------- #
         x_next  = plant.step(x, u, et, dt)
@@ -681,6 +720,7 @@ def main():
                 f"|r_L|={np.linalg.norm(x_next[0:3]):.6e} km   "
                 f"|q_L|={np.linalg.norm(x_next[6:10]):.12f}   "
                 f"|δr_1|={dr1_m:.6f} m"
+                f"m1={x_next[13]:.6f} m"
             )
 
         x   = x_next
