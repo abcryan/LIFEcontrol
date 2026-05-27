@@ -33,14 +33,12 @@ class Parameters:
     r_in            = 2.7               # ring inner radius (shared)
     r_out           = 3.8               # ring outer radius (shared)
 
-    # ── Propulsion ──────────────────────────────────────────────
-    ISP_L           = 220.0             # leader   specific impulse [s]
-    ISP_F           = 220.0             # follower specific impulse [s]
-    T_MAX           = 20.0              # max thrust PER THRUSTER  [N]
-                                         # (used to saturate the control input
-                                         #  in the truth model; matches the
-                                         #  20 N upper bound in Malladi et al.
-                                         #  Sec. IV; user may tune this freely)
+    # ── Thrusters ──────────────────────────────────────────────
+    l_cube          = 0.735             # side length of the thruster cube sitting at r_out [m]
+    ISP             = 3000.0            # Xenon Thruster specific impulse [s]
+    T_MAX           = 0.003             # max thrust PER THRUSTER  [N] 
+                                        # based on TPF-E 2008 paper --> max. 3.0 mN thrust.
+
 
     # ── SRP ─────────────────────────────────────────────────────
     c_reflect       = 1.8               # SRP reflectivity coefficient (Webb-like)
@@ -79,15 +77,13 @@ class Parameters:
         # ── Initial inertias (full ring mass = dry + propellant) ──
         m_ring_init_L = m_ring_dry_L + self.m_prop_init_L
         m_ring_init_F = m_ring_dry_F + self.m_prop_init_F
-        s("J_init_L", inertia(m_ring_init_L, self.r_in, self.r_out, self.h_ring, J_cyl_L))
-        s("J_init_F", inertia(m_ring_init_F, self.r_in, self.r_out, self.h_ring, J_cyl_F))
+        J_i_L   = m_ring_init_L * J_ring_unit(self.r_in, self.r_out, self.h_ring) + J_cyl_L
+        J_i_F   = m_ring_init_F * J_ring_unit(self.r_in, self.r_out, self.h_ring) + J_cyl_F
+        s("J_init_L", J_i_L)
+        s("J_init_F", J_i_F)
 
         # Cylindrical "cannonball" projected area (rectangle 2r × h)
         s("SRP_area_L", 2 * self.r_cylinder * self.h_cylinder_L)
         s("SRP_area_F", 2 * self.r_cylinder * self.h_cylinder_F)
 
 
-
-def inertia(m_ring, r_in, r_out, h_ring, J_cylinder) -> np.ndarray:
-    """Total J = m_ring * K_ring + J_cylinder."""
-    return m_ring * J_ring_unit(r_in, r_out, h_ring) + J_cylinder

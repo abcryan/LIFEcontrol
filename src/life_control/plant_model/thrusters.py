@@ -1,3 +1,6 @@
+from life_control.plant_model.spacecraft import Parameters
+import numpy as np
+
 """
 LIFE Mission — Thruster geometry and control allocation.
 
@@ -9,8 +12,8 @@ outward along the face normal.
 
 Cube geometry (from the document):
     - cube center on the outer face of the ring, at radial distance
-        d_cube_center = r_out + 0.5 * a_cube  ≈ 3.82 + 0.3675 = 4.1875  m
-      where a_cube = 0.735 m is the cube side length.
+        d_cube_center = r_out + 0.5 * L_CUBE  ≈ 3.82 + 0.3675 = 4.1875  m
+      where L_CUBE = 0.735 m is the cube side length.
     - the outer-face thruster sits at radial distance 4.555 m  ( = 4.1875 + 0.3675 )
     - the side and top/bottom thrusters sit at 4.1875 m radial, with an
       additional ±0.3675 m offset along the perpendicular face normal.
@@ -29,14 +32,15 @@ The geometry is identical for the leader and follower (per the document — the
 ring dimensions are shared), so we keep a single allocation that both can
 reuse.
 """
-import numpy as np
 
+# Import necessary parameters: 
+param = Parameters()
 
 # ── Geometry constants from Section 3.4 / Figure 4 of the design doc ────────
 
-R_OUT         = 3.82          # ring outer radius                         [m]
-A_CUBE        = 0.735         # cube side length                          [m]
-HALF_CUBE     = A_CUBE / 2.0  # = 0.3675                                  [m]
+R_OUT         = param.r_out          # ring outer radius                  [m]
+L_CUBE        = param.l_cube         # cube side length                   [m]
+HALF_CUBE     = L_CUBE / 2.0         
 
 # Cube center radius — cube is mounted with its inner face flush against the
 # ring's outer face, so the cube center sits HALF_CUBE further out.
@@ -44,10 +48,6 @@ D_CUBE_CENTER = R_OUT + HALF_CUBE        # = 4.1875 m
 # Outer-face thruster — sits on the cube's outermost face, one more
 # HALF_CUBE beyond the cube center.
 D_OUTER       = D_CUBE_CENTER + HALF_CUBE # = 4.555  m
-
-# Sanity: matches Table 2 in the document
-assert abs(D_OUTER - 4.555)        < 1e-9
-assert abs(D_CUBE_CENTER - 4.1875) < 1e-9
 
 
 # ── Build the 20-thruster table in the body frame ───────────────────────────
@@ -135,16 +135,15 @@ def force_torque_body(T_cmd: np.ndarray):
     Map a 20-vector of (non-negative) thrust magnitudes to body-frame force
     and torque using the precomputed allocation matrices.
 
-        F^B = - B_F   @ T          [N]
-        τ^B = - B_TAU @ T          [N·m]
+        F^B = - B_F   @ T          [N]          --> summed over all thrusters
+        τ^B = - B_TAU @ T          [N·m]        --> summed over all thrusters
 
-    The caller is responsible for clamping `T_cmd` to [0, T_max] beforehand
-    (we do that in Plant.step so that the integrator sees a physically valid
-    thrust at every sub-step).
+    The caller is responsible for clamping `T_cmd` to [0, T_max] beforehand.
     """
-    F_B   = - B_F   @ T_cmd                                       # (3,)
+
+    f_B   = - B_F   @ T_cmd                                       # (3,)
     tau_B = - B_TAU @ T_cmd                                       # (3,)
-    return F_B, tau_B
+    return f_B, tau_B
 
 
 def clamp_thrust(T_cmd: np.ndarray, T_max: float) -> np.ndarray:

@@ -36,7 +36,6 @@ used in the translational dynamics → rotation-translation coupling.
 """
 
 import numpy as np
-from types import SimpleNamespace
 
 # File Imports
 from life_control.config.config import KERNELS, BODIES, FRAME, ABCORR, OBSERVER
@@ -49,13 +48,10 @@ from life_control.plant_model.thrusters import (
     clamp_thrust,
     force_torque_body,
 )
+from life_control.init.initialize_state import initialize_state
+from life_control.plot.plotting import (build_plot_spacecraft, plot_trajectory, plot_solar_system, plot_l2_rotating_frame_zoom)
 
-from life_control.plot.plotting import (plot_trajectory, plot_solar_system, plot_l2_rotating_frame_zoom)
-
-##############################################
-# Classes
-##############################################
-
+# Class Imports
 from life_control.spice.environment         import SpiceEnv
 from life_control.gnc.navigation            import Sensor
 from life_control.gnc.guidance              import Guidance
@@ -63,49 +59,6 @@ from life_control.gnc.control               import Controller
 from life_control.plant_model.plant         import Plant
 from life_control.plant_model.spacecraft    import Parameters
 
-
-##############################################
-# Methods
-##############################################
-
-
-
-# Initialize the stacked state vector for leader + followers.
-def initialize_state(formation, baseline, att_F, m_prop_init_F, x_init_L, n_sc):
-
-    if formation == "square planar" and att_F == "same as leader" and n_sc == 5:
-
-        delta_r0_list = [
-            np.array([ baseline,  0.0,      0.0]),   # follower_1: +x
-            np.array([-baseline,  0.0,      0.0]),   # follower_2: -x
-            np.array([ 0.0,       baseline, 0.0]),   # follower_3: +y
-            np.array([ 0.0,      -baseline, 0.0]),   # follower_4: -y
-        ]
-
-        q_init_F = np.array([1.0, 0.0, 0.0, 0.0])
-        w_init_F = np.array([0.001, 0.01, 0.0])
-
-        x0 = [x_init_L]
-        for dr0 in delta_r0_list:
-            dv0 = np.zeros(3)
-            x0.append(np.concatenate([dr0, dv0, q_init_F, w_init_F, [m_prop_init_F]]))
-        x = np.concatenate(x0)
-
-    else:
-        raise NotImplementedError(
-            "Formation geometry or attitude initialization not implemented."
-        )
-
-    return x
-
-
-# Build the per-spacecraft list of label/J_B namespaces consumed by the
-# plotting layer (kept minimal — only the two attributes the plots use).
-def build_plot_spacecraft(param, n_sc):
-    sc = [SimpleNamespace(label="leader", J_B=param.J_init_L)]
-    for i in range(1, n_sc):
-        sc.append(SimpleNamespace(label=f"follower_{i}", J_B=param.J_init_F))
-    return sc
 
 
 ##############################################
@@ -153,8 +106,7 @@ def main():
     baseline   = 0.1                       # 100 m
     att_F      = "same as leader"
 
-    x_init     = initialize_state(formation, baseline, att_F,
-                                  param.m_prop_init_F, x_init_L, n_sc)
+    x_init     = initialize_state(formation, baseline, att_F, param.m_prop_init_F, x_init_L, n_sc)
 
     # ─── Initial-state printout ──────────────────────────────────────
     print(f"\nEpoch  : {env.et2utc(et_init)}")
@@ -173,8 +125,8 @@ def main():
         print(f"  follower_{i}: |δr0| = {dr_m:.3f} m")
 
     # ─── Time grid + history buffers ─────────────────────────────────
-    dt          = 10.0
-    t_tot       = 0.05 * 86400
+    dt          = 100.0
+    t_tot       = 0.5 * 86400
     n_steps     = int(t_tot / dt)
     print_every = max(1, n_steps // 20)
 
@@ -196,13 +148,12 @@ def main():
         # ------------  Plan  ----------- #
         y_ref   = guidance.reference(et)
         u       = ctrl.compute(y_hat, y_ref, et)
-        # Quick manual test: fire thruster #6 (-x face of -x cube) on the
-        # leader at 1 N → continuous +x body-frame thrust of 1 N.  Uncomment
-        # to exercise the new actuator path.
-        u[0] = 1.0    # leader thruster index 6 (0-based: 5)
-        # u[2] = 1.0
-        # u[6] = 1.0
-        # u[7] = 1.0
+
+        # Quick manual test: fire all + - y thruster on leader at 1 N (clamped to 0.003 N)
+        u[1] = 1.0    
+        u[2] = 1.0
+        u[6] = 1.0
+        u[7] = 1.0
 
         # ------------   Act  ----------- #
         x_next  = plant.step(x, u, et, dt)
@@ -224,38 +175,6 @@ def main():
 
         x   = x_next
         et += dt
-
-    # ─── Per-follower diagnostic dump ────────────────────────────────
-    print("\n--- Final baselines and drift over the run ---")
-    for i in range(1, n_sc):
-        dr_init   = X_hist[0,  dim_x_sc*i : dim_x_sc*i + 3]
-        dr_final  = X_hist[-1, dim_x_sc*i : dim_x_sc*i + 3]
-        mag_init  = np.linalg.norm(dr_init)  * 1e3
-        mag_final = np.linalg.norm(dr_final) * 1e3
-        drift     = mag_final - mag_init
-        print(
-            f"  follower_{i:<2d} "
-            f"|δr0| = {mag_init:.6f} m   "
-            f"|δr(T)| = {mag_final:.9f} m   "
-            f"Δ|δr| = {drift*1e6:+.3f} μm   "
-            f"δr_final = [{dr_final[0]*1e3:+.6f}, {dr_final[1]*1e3:+.6f}, "
-            f"{dr_final[2]*1e3:+.6f}] m"
-        )
-
-    # ─── Pairwise follower comparison ────────────────────────────────
-    print("\n--- Pairwise follower-trajectory differences over full run ---")
-    for i in range(1, n_sc):
-        for j in range(i + 1, n_sc):
-            dr_i     = X_hist[:, dim_x_sc*i : dim_x_sc*i + 3]
-            dr_j     = X_hist[:, dim_x_sc*j : dim_x_sc*j + 3]
-            diff_mag = np.max(np.abs(np.linalg.norm(dr_i, axis=1)
-                                     - np.linalg.norm(dr_j, axis=1))) * 1e3
-            diff_vec = np.max(np.linalg.norm(dr_i - dr_j, axis=1)) * 1e3
-            print(
-                f"  follower_{i} vs follower_{j}: "
-                f"max ||δr_i| - |δr_j|| = {diff_mag:.3e} m, "
-                f"max |δr_i - δr_j| = {diff_vec:.3e} m"
-            )
 
     # ─── Plots ───────────────────────────────────────────────────────
     print("\nGenerating plots ...")

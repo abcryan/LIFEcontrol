@@ -344,19 +344,10 @@ class Plant:
         When the propellant tank is empty, ṁ = 0 by clamping; the caller
         should also zero the thrust command (which it does in `x_dot`).
         """
-        if m_prop <= 0.0:
-            return 0.0
-
-        if role == 'L':
-            Isp = self.param.ISP_L
-        elif role == 'F':
-            Isp = self.param.ISP_F
-        else:
-            raise ValueError(f"Invalid role {role!r}: expected 'L' or 'F'")
-
+        
         # Σ |T_l| in newtons → kN
         T_sum_kN = float(np.sum(T_cmd)) / const.N_PER_KN
-        return - T_sum_kN / (Isp * const.G0)
+        return - T_sum_kN / (self.param.ISP * const.G0)
 
     # ── Mass / inertia helpers ──────────────────────────────────────────────
 
@@ -372,10 +363,12 @@ class Plant:
     def _inertia_now(self, m_prop, role):
         """
         Current J_B(m_prop) for the given role.
-        J = (m_ring_dry + m_prop) · K_ring + J_cyl
+        J = (m_ring_dry + m_prop) · J_ring_unit + J_cyl
         Propellant occupies the same annular envelope as the dry ring, so the
-        same K_ring multiplies the combined ring mass.
+        same J_ring_unit multiplies the combined ring mass.
         """
+        J_now = np.zeros((3, 3))
+
         if role == 'L':
             m_ring_dry, J_cyl = self.param.m_ring_dry_L, self.param.J_cylinder_L
         elif role == 'F':
@@ -384,7 +377,10 @@ class Plant:
             raise ValueError(f"Invalid role {role!r}: expected 'L' or 'F'")
 
         m_ring = m_ring_dry + max(m_prop, 0.0)
-        return inertia(m_ring, self.param.r_in, self.param.r_out, self.param.h_ring, J_cyl)
+        J_now = m_ring * J_ring_unit(self.param.r_in, self.param.r_out, self.param.h_ring) + J_cyl
+
+        return J_now
+
 
     def _inertia_dot_now(self, m_dot):
         """
@@ -393,7 +389,10 @@ class Plant:
         so dJ/dt = ṁ_prop · K_ring. Geometry (r_in, r_out, h_ring) is
         shared between leader and follower, so no role dispatch is needed.
         """
-        return inertia_dot(m_dot, self.param.r_in, self.param.r_out, self.param.h_ring)
+        J_dot_now = np.zeros((3, 3))
+        J_dot_now = m_dot * J_ring_unit(self.param.r_in, self.param.r_out, self.param.h_ring)
+
+        return J_dot_now
 
     # ── Slicing / quaternion utilities ──────────────────────────────────────
 
@@ -413,18 +412,3 @@ class Plant:
     def _slice_u(i, dim_u_sc):
         """Control slice for spacecraft i (length dim_u_sc)."""
         return slice(dim_u_sc * i, dim_u_sc * (i + 1))
-
-
-
-
-
-
-
-def inertia(m_ring, r_in, r_out, h_ring, J_cylinder) -> np.ndarray:
-    """Total J = m_ring * K_ring + J_cylinder."""
-    return m_ring * J_ring_unit(r_in, r_out, h_ring) + J_cylinder
-
-
-def inertia_dot(m_dot, r_in, r_out, h_ring) -> np.ndarray:
-    """dJ/dt = ṁ_ring * K_ring   (cylinder is constant)."""
-    return m_dot * J_ring_unit(r_in, r_out, h_ring)

@@ -15,6 +15,7 @@ which is the appropriate frame for visualizing the formation at mm-to-m scale.
 """
 import numpy as np
 import spiceypy as spice
+from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -104,6 +105,19 @@ def sun_earth_l2_frame(
     v_l2 = v_sun + np.cross(omega_vec, r_l2 - r_sun)
 
     return dict(r_l2=r_l2, v_l2=v_l2, e_x=e_x, e_y=e_y, e_z=e_z, omega_vec=omega_vec)
+
+
+
+# ── Plot 0: Spacecraft List ────────────────────────────────────────────────
+
+# Build the per-spacecraft list of label/J_B namespaces consumed by the
+# plotting layer (kept minimal — only the two attributes the plots use).
+def build_plot_spacecraft(param, n_sc):
+    sc = [SimpleNamespace(label="leader", J_B=param.J_init_L)]
+    for i in range(1, n_sc):
+        sc.append(SimpleNamespace(label=f"follower_{i}", J_B=param.J_init_F))
+    return sc
+
 
 
 # ── Plot 1: trajectory summary (multi-spacecraft) ────────────────────────────
