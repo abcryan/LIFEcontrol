@@ -47,7 +47,7 @@ from scipy.integrate import solve_ivp
 # If your main file is called e.g. `truth_model.py`, use:
 #     from truth_model import SpiceEnv, Plant
 # For the demo here we assume it is importable as `plant_module`.
-from main import SpiceEnv, Plant
+from life_control.__main__ import SpiceEnv, Plant
 
 
 # ── Direct relative-state propagator ─────────────────────────────────────────

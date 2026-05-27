@@ -15,8 +15,8 @@ import pytest
 
 # Adjust the import to wherever your functions actually live, e.g.:
 # from lifecontrol.core.attitude import Quat_to_CTM, CTM_to_Quat
-from utils.coordinate_trafos.CTM_to_Quat import CTM_to_Quat
-from utils.coordinate_trafos.Quat_to_CTM import Quat_to_CTM
+from life_control.utils.coordinate_trafos.CTM_to_Quat import CTM_to_Quat
+from life_control.utils.coordinate_trafos.Quat_to_CTM import Quat_to_CTM
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

@@ -11,12 +11,12 @@ Integrated Navigation Systems," 2nd ed.:
 import time
 import numpy as np
 
-from utils.coordinate_trafos.Quat_to_Euler import quat_to_euler
-from utils.coordinate_trafos.Euler_to_Quat import euler_to_quat
-from utils.coordinate_trafos.Quat_to_CTM import quat_to_CTM
-from utils.coordinate_trafos.CTM_to_Quat import CTM_to_quat
-from utils.coordinate_trafos.Euler_to_CTM    import euler_to_CTM
-from utils.coordinate_trafos.CTM_to_Euler    import CTM_to_euler
+from life_control.utils.coordinate_trafos.Quat_to_Euler import quat_to_euler
+from life_control.utils.coordinate_trafos.Euler_to_Quat import euler_to_quat
+from life_control.utils.coordinate_trafos.Quat_to_CTM import quat_to_CTM
+from life_control.utils.coordinate_trafos.CTM_to_Quat import CTM_to_quat
+from life_control.utils.coordinate_trafos.Euler_to_CTM    import euler_to_CTM
+from life_control.utils.coordinate_trafos.CTM_to_Euler    import CTM_to_euler
 
 # ---------------------------------------------------------------------------
 # Tolerances

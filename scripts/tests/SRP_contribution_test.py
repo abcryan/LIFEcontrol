@@ -49,7 +49,7 @@ import numpy as np
 
 # Import truth-model classes. Adjust this import to match your filename.
 # If your main module is `main.py`, this will work:
-from main import (
+from life_control.__main__ import (
     SpiceEnv,
     SpacecraftParams,
     Plant,
