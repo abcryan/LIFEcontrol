@@ -3,6 +3,68 @@ import numpy as np
 
 from life_control.utils.physics import J_cylinder_unit, J_ring_unit
 
+
+@dataclass(frozen=True)
+class PhysicsFlags:
+    """
+    Toggleable physics terms for the truth model.
+
+    Each flag corresponds to one acceleration or torque term in the dynamics.
+    When False, the corresponding `acc_*` / `attitude_tau_*` method returns
+    np.zeros(3) regardless of state. This lets you:
+
+      - Compare contributions of different perturbations (run with one term
+        on, all others off, and integrate to see the effect on the orbit).
+      - Profile the computational cost of each term cleanly: the architecture
+        and dispatch cost is the same in every run, so timing differences
+        between flag configurations reflect the cost of the physics only.
+      - Reproduce results: the flag configuration is part of the run config
+        and can be stamped into outputs.
+
+    Defaults:
+        Everything that is currently *implemented* defaults to True.
+        Terms that are stubs (ion, process noise) default to False.
+        ISC gravity defaults to True since we just implemented it.
+
+    Note on `a_ctrl` / `tau_ctrl`:
+        Control terms are NOT flag-gated. The actuator output is part of
+        the input `u`, not the dynamics. To "disable" control, zero the
+        control vector in your main loop. Flag-gating control would conflate
+        "we don't model thrusters" with "we don't fire thrusters this step",
+        which are different things.
+    """
+
+    # ── Translational acceleration terms ─────────────────────────────
+    grav_nbody:    bool = True    # N-body gravity (Sun, planets, Moon)
+    srp:           bool = True    # solar radiation pressure (cannonball)
+    grav_isc:      bool = True    # inter-spacecraft gravity
+    ion:           bool = False   # continuous ion thrust (not implemented)
+    proc_noise_a:  bool = False   # translational process noise (not implemented)
+
+    # ── Rotational torque terms ──────────────────────────────────────
+    tau_srp:       bool = False   # SRP-induced torque (not implemented)
+    tau_p:         bool = False   # rotational process noise (not implemented)
+
+    # ── Rotational dynamics structural terms ─────────────────────────
+    # These are not "perturbations" — they're parts of Euler's equation.
+    # Off by default = False would give nonsensical rotational dynamics,
+    # so they default True. Exposing them lets you test e.g. "what happens
+    # if I treat J as constant?" or "what if I drop gyroscopic coupling?"
+    gyro_coupling: bool = True    # -ω × (Jω) term
+    j_dot_term:    bool = True    # -J̇ω term (only nonzero during burn)
+
+    # ── Mass dynamics  term ─────────────────────────────────────────
+    mass_change: bool = True
+
+    def summary(self) -> str:
+        """One-line printable summary, useful for run headers and logs."""
+        on  = [name for name, val in self.__dict__.items() if val]
+        off = [name for name, val in self.__dict__.items() if not val]
+        return f"PhysicsFlags(ON: {on};  OFF: {off})"
+    
+
+
+
 @dataclass(frozen=True)
 class Parameters:
 
@@ -13,9 +75,9 @@ class Parameters:
     # m_cyl       : inner solid cylinder, structural, constant
     # m_ring_dry  : outer ring structure (walls, tanks, plumbing), constant
     # m_prop      : propellant inside the ring, variable, 0 ≤ m_prop ≤ m_prop_init
-    m_init_L        = 4150.0            # leader   total initial mass
+    m_init_L        = 3150.0            # leader   total initial mass
     m_init_F        = 3150.0            # follower total initial mass
-    m_cylinder_L    = 3000.0            # leader   inner cylinder (constant)
+    m_cylinder_L    = 2000.0            # leader   inner cylinder (constant)
     m_cylinder_F    = 2000.0            # follower inner cylinder (constant)
     m_prop_init_L   = 150.0             # leader   usable propellant
     m_prop_init_F   = 150.0             # follower usable propellant
@@ -38,7 +100,6 @@ class Parameters:
     ISP             = 3000.0            # Xenon Thruster specific impulse [s]
     T_MAX           = 0.003             # max thrust PER THRUSTER  [N] 
                                         # based on TPF-E 2008 paper --> max. 3.0 mN thrust.
-
 
     # ── SRP ─────────────────────────────────────────────────────
     c_reflect       = 1.8               # SRP reflectivity coefficient (Webb-like)
@@ -85,5 +146,3 @@ class Parameters:
         # Cylindrical "cannonball" projected area (rectangle 2r × h)
         s("SRP_area_L", 2 * self.r_cylinder * self.h_cylinder_L)
         s("SRP_area_F", 2 * self.r_cylinder * self.h_cylinder_F)
-
-

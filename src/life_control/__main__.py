@@ -36,6 +36,7 @@ used in the translational dynamics → rotation-translation coupling.
 """
 
 import numpy as np
+import time
 
 # File Imports
 from life_control.config.config import KERNELS, BODIES, FRAME, ABCORR, OBSERVER
@@ -50,6 +51,7 @@ from life_control.plant_model.thrusters import (
 )
 from life_control.init.initialize_state import initialize_state
 from life_control.plot.plotting import (build_plot_spacecraft, plot_trajectory, plot_solar_system, plot_l2_rotating_frame_zoom)
+from life_control.analysis.term_analysis import (analyze_follower_terms, print_term_table)
 
 # Class Imports
 from life_control.spice.environment         import SpiceEnv
@@ -57,7 +59,7 @@ from life_control.gnc.navigation            import Sensor
 from life_control.gnc.guidance              import Guidance
 from life_control.gnc.control               import Controller
 from life_control.plant_model.plant         import Plant
-from life_control.plant_model.spacecraft    import Parameters
+from life_control.plant_model.spacecraft    import Parameters, PhysicsFlags
 
 
 
@@ -70,6 +72,7 @@ def main():
     # ─── Environment + Parameters ────────────────────────────────────
     env   = SpiceEnv(KERNELS, BODIES, FRAME, ABCORR, OBSERVER)
     param = Parameters()
+    flags = PhysicsFlags()
 
     # ─── MODEL Settings ──────────────────────────────────────────────
     # n_sc = 1 leader + (n_sc − 1) followers
@@ -88,7 +91,7 @@ def main():
     sensor     = Sensor()
     ctrl       = Controller(dim_u)
     guidance   = Guidance(dim_y)
-    plant      = Plant(env, param, n_sc, dim_x_sc, dim_u_sc)
+    plant      = Plant(env, param, flags, n_sc, dim_x_sc, dim_u_sc)
 
     # ─── SIMULATION Parameters ───────────────────────────────────────
     et_init    = env.str2et("2026-05-12T00:00:00")
@@ -97,16 +100,16 @@ def main():
     r_init_L   = np.array([-9.594503991242750e7, -1.098032827423822e8, -4.778858640538428e7])   # [km]
     v_init_L   = np.array([ 2.279303677102495e1, -1.735582913273474e1, -7.640659579588683e0])   # [km/s]
     q_init_L   = np.array([1.0, 0.0, 0.0, 0.0])
-    w_init_L   = np.array([0.0, 0.0, 0.0])
+    w_init_L   = np.array([0.0, 0.01, 0.0])               # [rad/s]
     x_init_L   = np.concatenate((r_init_L, v_init_L, q_init_L, w_init_L,
                                  [param.m_prop_init_L]))
 
     # Initial formation
-    formation  = "square planar"
+    formation  = "square planar"           
     baseline   = 0.1                       # 100 m
     att_F      = "same as leader"
 
-    x_init     = initialize_state(formation, baseline, att_F, param.m_prop_init_F, x_init_L, n_sc)
+    x_init     = initialize_state(formation, baseline, att_F, param.m_prop_init_F, x_init_L, n_sc)  
 
     # ─── Initial-state printout ──────────────────────────────────────
     print(f"\nEpoch  : {env.et2utc(et_init)}")
@@ -123,6 +126,7 @@ def main():
     for i in range(1, n_sc):
         dr_m = np.linalg.norm(x_init[dim_x_sc*i : dim_x_sc*i + 3]) * 1e3
         print(f"  follower_{i}: |δr0| = {dr_m:.3f} m")
+    print(f"\nPhysics: {flags.summary()}")
 
     # ─── Time grid + history buffers ─────────────────────────────────
     dt          = 100.0
@@ -131,15 +135,35 @@ def main():
     print_every = max(1, n_steps // 20)
 
     t_hist          = np.zeros(n_steps + 1)
+    delta_t_hist    = np.zeros(n_steps + 1)
+
     X_hist          = np.zeros((n_steps + 1, dim_x))
     X_hist[0, :]    = x_init
 
     print(f"\n--- Epoch-stepping simulation: {n_steps} steps of {dt:.1f} s "
           f"({n_steps * dt / 3600:.2f} h total) ---")
 
-    # ─── Main control loop ───────────────────────────────────────────
     et = et_init
     x  = x_init
+
+    # ─── Test relative dynamic magnitudes ───────────────────────────────────────────
+
+#     u_test = np.zeros(dim_u)
+#     u_test[dim_u_sc*1 + 1] = 1.0   # fire one follower thruster at max thrust
+# #
+#     results = analyze_follower_terms(
+#         plant, x_init, et_init,
+#         follower_index = 1,
+#         u              = u_test,        # or None
+#         dim_x_sc       = dim_x_sc,
+#         dim_u_sc       = dim_u_sc,
+#     )
+#     print_term_table(results,
+#         title="Collector (follower 1) relative-accel terms @ epoch 0")
+
+
+    # ─── Main control loop ───────────────────────────────────────────
+
     for k in range(n_steps):
 
         # ------------  Sense ----------- #
@@ -150,15 +174,19 @@ def main():
         u       = ctrl.compute(y_hat, y_ref, et)
 
         # Quick manual test: fire all + - y thruster on leader at 1 N (clamped to 0.003 N)
-        u[1] = 1.0    
-        u[2] = 1.0
-        u[6] = 1.0
-        u[7] = 1.0
+        # u[1] = 1.0    
+        # u[2] = 1.0
+        # u[6] = 1.0
+        # u[7] = 1.0
 
+        t_i = time.perf_counter()
         # ------------   Act  ----------- #
         x_next  = plant.step(x, u, et, dt)
+        
+        delta_t = time.perf_counter() - t_i
 
         # ------------  Data  ----------- #
+        delta_t_hist[k + 1]    = delta_t
         t_hist[k + 1]    = (k + 1) * dt
         X_hist[k + 1, :] = x_next
 
@@ -167,10 +195,11 @@ def main():
             mprop_L = x_next[13]
             print(
                 f"  k={k+1:5d}/{n_steps}  t={(k+1)*dt/3600:6.3f} h   "
+                f"t_step={delta_t:.4f} s   "                             
                 f"|r_L|={np.linalg.norm(x_next[0:3]):.6e} km   "
                 f"|q_L|={np.linalg.norm(x_next[6:10]):.12f}   "
                 f"|δr_1|={dr1_m:.6f} m   "
-                f"m_prop_L={mprop_L:.4f} kg"
+                f"m_prop_L={mprop_L:.4f} kg   "
             )
 
         x   = x_next

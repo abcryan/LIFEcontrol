@@ -5,4 +5,5 @@ R_SUN_AU        = 1.495978707e8     # 1 AU                     [km]
 G0              = 9.80665e-3        # standard gravity         [km/s^2]
 KM_PER_M        = 1.0e-3            # km / m
 N_PER_KN        = 1.0e3             # N per kN
+G_KM            = 6.6743e-20        # Newton's gravitational constant [km³ / kg / s²]
 
