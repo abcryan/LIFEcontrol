@@ -38,12 +38,13 @@ class PhysicsFlags:
     grav_nbody:    bool = True    # N-body gravity (Sun, planets, Moon)
     srp:           bool = True    # solar radiation pressure (cannonball)
     grav_isc:      bool = True    # inter-spacecraft gravity
-    ion:           bool = False   # continuous ion thrust (not implemented)
-    proc_noise_a:  bool = False   # translational process noise (not implemented)
+    # ion: bool = False
+    # proc_noise_a: bool = False
+    # tau_p: bool = False
 
     # ── Rotational torque terms ──────────────────────────────────────
-    tau_srp:       bool = False   # SRP-induced torque (not implemented)
-    tau_p:         bool = False   # rotational process noise (not implemented)
+    tau_srp:       bool = False    # SRP-induced torque 
+    tau_grav:      bool = False    # Torque induced by differential gravity
 
     # ── Rotational dynamics structural terms ─────────────────────────
     # These are not "perturbations" — they're parts of Euler's equation.
@@ -94,6 +95,13 @@ class Parameters:
     r_cylinder      = 2.57              # cylinder radius (shared)
     r_in            = 2.7               # ring inner radius (shared)
     r_out           = 3.8               # ring outer radius (shared)
+
+    # ── SRP centre-of-pressure offset (body frame, COM -> COP) [m] ──
+    # Small COM/COP asymmetry, ~2-3% of the ~5 m body length. z = cylinder axis;
+    # axial term dominates (fore/aft mass asymmetry), lateral terms from build
+    # tolerance. Replace with mass-properties analysis when available.
+    r_CP_L = np.array([ 0.045, -0.030,  0.120])   # |r| ≈ 0.132 m
+    r_CP_F = np.array([-0.035,  0.050,  0.105])   # |r| ≈ 0.122 m
 
     # ── Thrusters ──────────────────────────────────────────────
     l_cube          = 0.735             # side length of the thruster cube sitting at r_out [m]

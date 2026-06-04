@@ -38,14 +38,6 @@ class Plant:
       Pairwise vectors are computed from δr (relative state) so the
       mm-floor benefit of the relative-state design is preserved.
 
-    Environment snapshot (NEW):
-      Ephemeris body positions are fetched ONCE per RHS call via
-      `_body_snapshot` and threaded through every consumer (N-body gravity
-      for the leader and every follower, the gravity-gradient torque, and
-      the SRP Sun direction).  Previously `body_position` was queried once
-      per body *per spacecraft*; now it is once per body *per step*.  The
-      two new attitude torques therefore add no extra ephemeris lookups.
-
     PhysicsFlags:
       A frozen dataclass of bool flags is held in `self.flags`. Each
       acc_*/attitude_tau_* helper checks its own flag at the top and
@@ -99,14 +91,6 @@ class Plant:
         # reconstructed from SSB-absolute positions, preserving the mm-floor.
         delta_r_all, m_total_all = self._fleet_snapshot(x)
 
-        # ── Body (ephemeris) snapshot ───────────────────────────────────
-        # Fetch every gravitating body's position ONCE per RHS call. Shared
-        # by N-body gravity (leader + followers), the gravity-gradient torque,
-        # and the SRP Sun direction. This is what keeps the two new torque
-        # terms (essentially) free: they reuse positions already needed for
-        # the translational dynamics instead of re-querying the ephemeris.
-        bodies = self._body_snapshot(et)
-
         # Leader's absolute position — only needed for terms with absolute
         # dependence on Sun/planets (gravity_abs, srp_abs).
         r_L = x[self._slice_x(0, self.dim_x_sc)][0:3]
@@ -146,23 +130,17 @@ class Plant:
         # a_ctrl in [km/s^2]:  (F[N] / m[kg]) * (1e-3 km/m)
         a_ctrl_L    = (F_I_L / m_total_L) * const.KM_PER_M
 
-        # Leader's own absolute SRP acceleration [km/s^2]. Computed ONCE here
-        # and reused for (a) the translational dynamics and (b) the SRP torque.
-        a_srp_I_L   = self.acc_srp_abs(r_L, m_total_L, 'L', bodies)
-
         # Absolute Translational Dynamics — leader uses absolute ISC sum
         r_dot_L     = v_L
-        v_dot_L     = self.acc_rhs_abs(r_L, a_ctrl_L, a_srp_I_L,
-                                       0, delta_r_all, m_total_all, bodies)
+        v_dot_L     = self.acc_rhs_abs(r_L, m_total_L, a_ctrl_L,
+                                       0, delta_r_all, m_total_all, 'L', et)
 
         # Mass Derivative (Tsiolkovsky, per-thruster sum)
         m_dot_L     = self.mass_rhs(m_prop_L, T_L, 'L')
 
         # Rotational Kinematics + Dynamics
         q_dot_L     = self.attitude_kin_rhs(q_L, w_L)
-        w_dot_L     = self.attitude_dyn_rhs(w_L, m_prop_L, m_dot_L, m_total_L,
-                                            tau_ctrl_L, 'L',
-                                            q_L, r_L, a_srp_I_L, bodies)
+        w_dot_L     = self.attitude_dyn_rhs(w_L, m_prop_L, m_dot_L, tau_ctrl_L, 'L')
 
         xdot[self._slice_x(0, self.dim_x_sc)] = np.concatenate(
             [r_dot_L, v_dot_L, q_dot_L, w_dot_L, [m_dot_L]]
@@ -196,34 +174,19 @@ class Plant:
             F_I_i       = quat_to_CTM(q_i).T @ F_B_i                   # [N]
             a_ctrl_i    = (F_I_i / m_total_i) * const.KM_PER_M
 
-            # Follower's absolute inertial position. Reconstructed at SSB scale
-            # ONLY for terms that genuinely live at that scale (SRP 1/r², and
-            # the line of sight to distant bodies for the gravity-gradient
-            # torque) — both use directions/magnitudes that are well
-            # conditioned at SSB scale, unlike the pairwise ISC separations.
-            r_F         = r_L + delta_r
-
-            # Follower's own absolute SRP acceleration — computed ONCE and
-            # reused for the differential translational term AND the torque.
-            a_srp_I_F   = self.acc_srp_abs(r_F, m_total_i, 'F', bodies)
-            # Differential SRP (follower − leader), identical to the previous
-            # acc_srp_rel result, now assembled from the two cached accels.
-            a_srp_diff  = a_srp_I_F - a_srp_I_L
-
             # Relative Translational Dynamics — ISC enters as a_F − a_L
             r_dot_i     = delta_v
-            v_dot_i     = self.acc_rhs_rel(r_L, delta_r, a_srp_diff,
+            v_dot_i     = self.acc_rhs_rel(r_L, delta_r,
+                                           m_total_L, m_total_i,
                                            a_ctrl_L, a_ctrl_i,
-                                           i, delta_r_all, m_total_all, bodies)
+                                           i, delta_r_all, m_total_all, et)
 
             # Mass Derivative
             m_dot_i     = self.mass_rhs(m_prop_i, T_i, 'F')
 
             # Rotational Kinematics + Dynamics (attitude is absolute)
             q_dot_i     = self.attitude_kin_rhs(q_i, w_i)
-            w_dot_i     = self.attitude_dyn_rhs(w_i, m_prop_i, m_dot_i, m_total_i,
-                                                tau_ctrl_i, 'F',
-                                                q_i, r_F, a_srp_I_F, bodies)
+            w_dot_i     = self.attitude_dyn_rhs(w_i, m_prop_i, m_dot_i, tau_ctrl_i, 'F')
 
             xdot[self._slice_x(i, self.dim_x_sc)] = np.concatenate(
                 [r_dot_i, v_dot_i, q_dot_i, w_dot_i, [m_dot_i]]
@@ -266,104 +229,74 @@ class Plant:
 
         return delta_r_all, m_total_all
 
-    # ── Body (ephemeris) snapshot ────────────────────────────────────────────
-
-    def _body_snapshot(self, et):
-        """
-        Ephemeris positions of every gravitating body at epoch `et`, fetched
-        ONCE per RHS call and reused by all consumers that need a body
-        position:
-
-          - N-body gravity acceleration  (acc_grav_abs / acc_grav_rel),
-          - the gravity-gradient torque  (attitude_tau_grav),
-          - the SRP Sun direction        (acc_srp_abs, via the 'SUN' entry).
-
-        Returns a dict {body_name: r_body [km]} keyed exactly like env.GM.
-        Empty dict when nothing needs body positions (every consumer is
-        flag-gated and short-circuits before indexing this dict, so an empty
-        snapshot never raises).
-
-        Cost note: previously body_position() ran once per body *per
-        spacecraft* (leader in acc_grav_abs + each follower in acc_grav_rel +
-        every spacecraft's SRP Sun lookup). It now runs once per body *per
-        step*, so adding the gravity-gradient torque does not add a single
-        ephemeris query.
-        """
-        if not (self.flags.grav_nbody or self.flags.tau_grav or self.flags.srp):
-            return {}
-        return {body: self.env.body_position(body, et) for body in self.env.GM}
-
     # ── Translational dynamics ──────────────────────────────────────────────
 
-    def acc_rhs_abs(self, r_I, a_ctrl, a_srp_I,
-                    i, delta_r_all, m_total_all, bodies):
+    def acc_rhs_abs(self, r_I, m_total, a_ctrl,
+                    i, delta_r_all, m_total_all, role, et):
         """Total absolute acceleration on a spacecraft (used by leader).
         `i` is the spacecraft index in the fleet, needed for the ISC sum.
-        `a_srp_I` is the spacecraft's own SRP acceleration, computed once by
-        the caller and passed in (also reused by the SRP torque). `bodies` is
-        the per-step ephemeris snapshot. Each contribution is flag-gated
-        inside its own routine — passing all args unconditionally keeps the
-        dispatch cost flat across runs.
+        Each contribution is flag-gated inside its own routine — passing
+        all args unconditionally keeps the dispatch cost flat across runs.
         """
-        a_tot = (self.acc_grav_abs(r_I, bodies)
-                 + a_srp_I
+        a_tot = (self.acc_grav_abs(r_I, et)
+                 + self.acc_srp_abs(r_I, m_total, role, et)
                  + self.acc_grav_isc_abs(i, delta_r_all, m_total_all)
+                 + self.acc_ion_abs()
+                 + self.acc_p_abs()
                  + a_ctrl)
         return a_tot
 
-    def acc_rhs_rel(self, r_L, delta_r, a_srp_diff,
-                    a_ctrl_L, a_ctrl_F,
-                    i, delta_r_all, m_total_all, bodies):
+    def acc_rhs_rel(self, r_L, delta_r,
+                    m_total_L, m_total_F, a_ctrl_L, a_ctrl_F,
+                    i, delta_r_all, m_total_all, et):
         """
         Total DIFFERENTIAL acceleration on a follower w.r.t. the leader.
         Each per-body subtraction is evaluated at well-conditioned scale
         to avoid catastrophic cancellation when differencing SSB-scale
         vectors. `i` is the follower's index in the fleet (>= 1).
-        `a_srp_diff` is the precomputed differential SRP (follower − leader).
         """
 
-        da_tot = (self.acc_grav_rel(r_L, delta_r, bodies)
-                  + a_srp_diff
+        da_tot = (self.acc_grav_rel(r_L, delta_r, et)
+                  + self.acc_srp_rel(r_L, delta_r, m_total_L, m_total_F, et)
                   + self.acc_grav_isc_rel(i, delta_r_all, m_total_all)
+                  + self.acc_ion_rel()
+                  + self.acc_p_rel()
                   + (a_ctrl_F - a_ctrl_L))
         return da_tot
 
-    def acc_grav_abs(self, r_I, bodies):
-        """N-body Solar System gravity at absolute r_I [km]. → [km/s^2].
-        Reads body positions from the per-step snapshot `bodies`."""
+    def acc_grav_abs(self, r_I, et):
+        """N-body Solar System gravity at absolute r_I [km]. → [km/s^2]"""
         if not self.flags.grav_nbody:
             return np.zeros(3)
         v_dot = np.zeros(3)
         for body, mu in self.env.GM.items():
-            dr    = r_I - bodies[body]
+            r_b   = self.env.body_position(body, et)
+            dr    = r_I - r_b
             v_dot -= mu * dr / np.linalg.norm(dr) ** 3
         return v_dot
 
-    def acc_grav_rel(self, r_L, delta_r, bodies):
+    def acc_grav_rel(self, r_L, delta_r, et):
         """
         Differential N-body gravity on follower at r_L + δr. Evaluated as
             Σ_b [ a_b(r_L + δr) − a_b(r_L) ]
         with each term kept at body-relative scale (d2 = d1 + δr, never
         d2 = r_F − r_b reconstructed from SSB-based absolutes).
-        Reads body positions from the per-step snapshot `bodies`.
         """
         if not self.flags.grav_nbody:
             return np.zeros(3)
         da = np.zeros(3)
         for body, mu in self.env.GM.items():
-            r_b = bodies[body]
+            r_b = self.env.body_position(body, et)
             d1  = r_L - r_b                       # body → leader
             d2  = d1 + delta_r                    # body → follower
             da -= mu * (d2 / np.linalg.norm(d2) ** 3
                       - d1 / np.linalg.norm(d1) ** 3)
         return da
 
-    def acc_srp_abs(self, r_I, m_total, role, bodies):
+    def acc_srp_abs(self, r_I, m_total, role, et):
         """
         Cannonball SRP at absolute position r_I; body of TOTAL mass `m_total`,
-        projected area A(role), reflectivity c_reflect.  → [km/s^2].
-        The Sun position is taken from the per-step snapshot `bodies` (no
-        extra ephemeris query).
+        projected area A(role), reflectivity c_reflect.  → [km/s^2]
         """
         if not self.flags.srp:
             return np.zeros(3)
@@ -377,7 +310,7 @@ class Plant:
 
         c_R = self.param.c_reflect
 
-        r_sun  = bodies["SUN"]
+        r_sun  = self.env.body_position("SUN", et)
         d      = r_I - r_sun
         d_norm = np.linalg.norm(d)
         u_hat  = d / d_norm                                            # sun → s/c (outward)
@@ -385,11 +318,18 @@ class Plant:
         a_mag  = c_R * (A / m_total) * P_at_r * const.KM_PER_M
         return a_mag * u_hat
 
-    # NOTE: acc_srp_rel has been removed. The differential SRP is now built in
-    # x_dot from the two cached absolute SRP accelerations (a_srp_I_F −
-    # a_srp_I_L), which is numerically identical to the old acc_srp_rel result
-    # but avoids recomputing the follower SRP twice (once for translation,
-    # once for torque).
+    def acc_srp_rel(self, r_L, delta_r, m_total_L, m_total_F, et):
+        """
+        Differential cannonball SRP: SRP(follower) − SRP(leader).
+        Two physical sources of mismatch:
+          (i)  position-dependent (1/r², sun-line) — ~|δr|/AU of nominal
+          (ii) parameter-dependent (m, A may differ between leader/follower)
+        """
+        if not self.flags.srp:
+            return np.zeros(3)
+        a_F = self.acc_srp_abs(r_L + delta_r, m_total_F, 'F', et)
+        a_L = self.acc_srp_abs(r_L,           m_total_L, 'L', et)
+        return a_F - a_L
 
     # ── Inter-spacecraft gravity ────────────────────────────────────────────
 
@@ -436,6 +376,31 @@ class Plant:
         a_L = self.acc_grav_isc_abs(0, delta_r_all, m_total_all)
         return a_i - a_L
 
+    # ── Other perturbations (stubs) ─────────────────────────────────────────
+
+    def acc_ion_abs(self):
+        if not self.flags.ion:
+            return np.zeros(3)
+        # TODO: continuous ion thrust (separate from a_ctrl chemical impulse)
+        return np.zeros(3)
+
+    def acc_ion_rel(self):
+        if not self.flags.ion:
+            return np.zeros(3)
+        # TODO
+        return np.zeros(3)
+
+    def acc_p_abs(self):
+        if not self.flags.proc_noise_a:
+            return np.zeros(3)
+        # TODO: process noise
+        return np.zeros(3)
+
+    def acc_p_rel(self):
+        if not self.flags.proc_noise_a:
+            return np.zeros(3)
+        # TODO
+        return np.zeros(3)
 
     # ── Rotational dynamics ─────────────────────────────────────────────────
 
@@ -444,23 +409,13 @@ class Plant:
         kinematics, not a perturbation."""
         return 0.5 * Omega_omega(omega) @ q
 
-    def attitude_dyn_rhs(self, omega, m_prop, m_dot, m_total,
-                         tau_ctrl, role,
-                         q, r_I, a_srp_I, bodies):
+    def attitude_dyn_rhs(self, omega, m_prop, m_dot, tau_ctrl, role):
         """
         Euler's rotational equation with a TIME-VARYING inertia:
-
-            J(m_prop) ω̇ = τ_ctrl + τ_SRP + τ_grav + τ_p
-                           − ω × (J ω) − J̇ ω
+            J(m_prop) ω̇  =  τ_SRP + τ_p + τ_ctrl  −  ω × (J ω)  −  J̇ ω
 
         J(m_prop) = J_cyl(role) + (m_ring_dry(role) + m_prop) · K_ring
         J̇         = ṁ_prop · K_ring
-
-        J is built ONCE here and shared with attitude_tau_grav (which needs it
-        for the gravity-gradient couple), so the new torque term costs no
-        extra inertia build. The environmental torques receive the body-frame
-        attitude `q`, the inertial position `r_I`, the cached SRP acceleration
-        `a_srp_I`, and the per-step body snapshot `bodies`.
 
         The gyroscopic coupling (−ω × Jω) and the J̇ω term are flag-gated
         because they are *structural* parts of Euler's equation that the
@@ -471,9 +426,9 @@ class Plant:
         J_dot = self._inertia_dot_now(m_dot)
         J_inv = np.linalg.inv(J)
 
-        tau_tot = (tau_ctrl
-                   + self.attitude_tau_srp(q, a_srp_I, m_total, role)
-                   + self.attitude_tau_grav(q, r_I, J, bodies))
+        tau_tot = (self.attitude_tau_SRP()
+                   + self.attitude_tau_p()
+                   + tau_ctrl)
 
         if self.flags.gyro_coupling:
             tau_tot = tau_tot - np.cross(omega, J @ omega)
@@ -483,71 +438,17 @@ class Plant:
 
         return J_inv @ tau_tot
 
-    def attitude_tau_srp(self, q, a_srp_I, m_total, role):
-        """
-        SRP torque about the COM (design-doc eq. 12):
-
-            τ_SRP^B = r_CP^B × f_SRP^B ,   f_SRP^B = m C_I^B(q) a_SRP^I
-
-        Reuses the cannonball SRP acceleration `a_srp_I` already computed for
-        the translational dynamics — no new Sun lookup or 1/r² evaluation.
-        `r_CP^B` is the body-frame vector from the COM (body-frame origin) to
-        the centre of pressure, supplied per role via self.param.
-
-        Dependency: this term scales with the SRP force, so it is non-zero
-        only when the translational SRP flag (`self.flags.srp`) is also on —
-        if SRP is disabled, a_srp_I is zero and so is the torque, by design.
-
-        Units: a_SRP^I [km/s²] → [m/s²] via / KM_PER_M, × m [kg] = f [N];
-        r_CP^B [m] × f [N] = τ [N·m].
-        """
+    def attitude_tau_SRP(self):
         if not self.flags.tau_srp:
             return np.zeros(3)
+        # TODO: SRP torque (depends on attitude and CoP offset)
+        return np.zeros(3)
 
-        # Rotate SRP accel inertial → body, scale to a body-frame force [N].
-        a_srp_B = quat_to_CTM(q) @ a_srp_I                  # km/s², body frame
-        f_srp_B = (m_total * a_srp_B) / const.KM_PER_M      # N,     body frame
-
-        r_cp = self.param.r_CP_L if role == 'L' else self.param.r_CP_F
-        return np.cross(r_cp, f_srp_B)
-
-    def attitude_tau_grav(self, q, r_I, J, bodies):
-        """
-        Gravity-gradient torque from every gravitating body (design-doc
-        eq. 13):
-
-            τ_grav^B = Σ_b (3 μ_b / |d_b|³) · û_b^B × (J û_b^B)
-
-        with  d_b   = r_I − r_b   (inertial line of sight to body b)
-              û_b^B = C_I^B(q) · d_b / |d_b|   (that line of sight in body axes).
-
-        Body positions r_b are read from the per-step snapshot `bodies` (the
-        same ones used by acc_grav_*), so this term adds no extra ephemeris
-        lookups. J is the inertia about the COM, passed in from
-        attitude_dyn_rhs (built once there).
-
-        Units: μ_b [km³/s²], |d_b| [km] ⇒ 3μ_b/|d_b|³ [1/s²]; J [kg·m²] ⇒
-        τ [kg·m²/s²] = [N·m]. The km length scale cancels in μ/|d|³, so no
-        length conversion is required.
-
-        Scale note: forming d_b = r_I − r_b directly at SSB scale is correct
-        here — the line of sight to a distant body genuinely IS an SSB-scale
-        vector, and only its *direction* is used (after normalisation). This
-        is unlike the pairwise ISC separations, where the small difference
-        itself is the quantity of interest and must be kept at relative scale.
-        """
-        if not self.flags.tau_grav:
+    def attitude_tau_p(self):
+        if not self.flags.tau_p:
             return np.zeros(3)
-
-        tau  = np.zeros(3)
-        C_IB = quat_to_CTM(q)                       # inertial → body
-        for body, mu in self.env.GM.items():
-            d      = r_I - bodies[body]             # r_sc − r_b  [km], inertial
-            d_norm = np.linalg.norm(d)
-            u_B    = C_IB @ (d / d_norm)            # line of sight, body frame
-            tau   += (3.0 * mu / d_norm ** 3) * np.cross(u_B, J @ u_B)
-        return tau
-
+        # TODO: process-noise torque
+        return np.zeros(3)
 
     # ── Mass dynamics ───────────────────────────────────────────────────────
 

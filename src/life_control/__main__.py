@@ -100,7 +100,7 @@ def main():
     r_init_L   = np.array([-9.594503991242750e7, -1.098032827423822e8, -4.778858640538428e7])   # [km]
     v_init_L   = np.array([ 2.279303677102495e1, -1.735582913273474e1, -7.640659579588683e0])   # [km/s]
     q_init_L   = np.array([1.0, 0.0, 0.0, 0.0])
-    w_init_L   = np.array([0.0, 0.01, 0.0])               # [rad/s]
+    w_init_L   = np.array([0.0, 0.0, 0.0])               # [rad/s]
     x_init_L   = np.concatenate((r_init_L, v_init_L, q_init_L, w_init_L,
                                  [param.m_prop_init_L]))
 
@@ -120,7 +120,7 @@ def main():
           f"(total mass {param.m_init_L:.1f} kg = {param.m_cylinder_L:.0f} cyl "
           f"+ {param.m_ring_dry_L:.0f} ring_dry + {param.m_prop_init_L:.0f} prop)")
     print(f"T_max / thruster: {param.T_MAX:.1f} N  "
-          f"({N_THRUSTERS} thrusters → max body-frame |F| ≈ "
+          f"({dim_u_sc} thrusters → max body-frame |F| ≈ "
           f"{param.T_MAX * np.linalg.norm(B_F, ord=2):.1f} N if all parallel)")
     print("Baselines (initial, [m]):")
     for i in range(1, n_sc):
