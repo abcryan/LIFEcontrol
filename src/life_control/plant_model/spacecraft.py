@@ -38,9 +38,6 @@ class PhysicsFlags:
     grav_nbody:    bool = True    # N-body gravity (Sun, planets, Moon)
     srp:           bool = True    # solar radiation pressure (cannonball)
     grav_isc:      bool = True    # inter-spacecraft gravity
-    # ion: bool = False
-    # proc_noise_a: bool = False
-    # tau_p: bool = False
 
     # ── Rotational torque terms ──────────────────────────────────────
     tau_srp:       bool = False    # SRP-induced torque 
