@@ -40,8 +40,8 @@ class PhysicsFlags:
     grav_isc:      bool = True    # inter-spacecraft gravity
 
     # ── Rotational torque terms ──────────────────────────────────────
-    tau_srp:       bool = False    # SRP-induced torque 
-    tau_grav:      bool = False    # Torque induced by differential gravity
+    tau_srp:       bool = True    # SRP-induced torque 
+    tau_grav:      bool = True    # Torque induced by differential gravity
 
     # ── Rotational dynamics structural terms ─────────────────────────
     # These are not "perturbations" — they're parts of Euler's equation.

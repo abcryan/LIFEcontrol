@@ -51,6 +51,8 @@ from life_control.plant_model.thrusters import (
 )
 from life_control.init.initialize_state import initialize_state
 from life_control.plot.plotting import (build_plot_spacecraft, plot_trajectory, plot_solar_system, plot_l2_rotating_frame_zoom)
+from life_control.plot.plot_guidance import test_guidance_trajectory
+from life_control.plot.plot_controller import plot_controller_summary
 from life_control.analysis.term_analysis import (analyze_follower_terms, print_term_table)
 
 # Class Imports
@@ -76,7 +78,7 @@ def main():
 
     # ─── MODEL Settings ──────────────────────────────────────────────
     # n_sc = 1 leader + (n_sc − 1) followers
-    n_sc       = 5
+    n_sc       = 2
 
     # State / measurement / control dimensions
     dim_x_sc   = 14                  # [x,y,z, vx,vy,vz, q0..q3, wx,wy,wz, m_prop]
@@ -86,12 +88,6 @@ def main():
     dim_x      = n_sc * dim_x_sc
     dim_y      = n_sc * dim_y_sc
     dim_u      = n_sc * dim_u_sc
-
-    # ─── Pipeline classes ────────────────────────────────────────────
-    sensor     = Sensor()
-    ctrl       = Controller(dim_u)
-    guidance   = Guidance(dim_y)
-    plant      = Plant(env, param, flags, n_sc, dim_x_sc, dim_u_sc)
 
     # ─── SIMULATION Parameters ───────────────────────────────────────
     et_init    = env.str2et("2026-05-12T00:00:00")
@@ -106,7 +102,7 @@ def main():
 
     # Initial formation
     formation  = "square planar"           
-    baseline   = 0.1                       # 100 m
+    baseline   = 0.3                       # 100 m
     att_F      = "same as leader"
 
     x_init     = initialize_state(formation, baseline, att_F, param.m_prop_init_F, x_init_L, n_sc)  
@@ -130,7 +126,7 @@ def main():
 
     # ─── Time grid + history buffers ─────────────────────────────────
     dt          = 100.0
-    t_tot       = 0.5 * 86400
+    t_tot       = 1.0 * 86400
     n_steps     = int(t_tot / dt)
     print_every = max(1, n_steps // 20)
 
@@ -161,6 +157,24 @@ def main():
 #     print_term_table(results,
 #         title="Collector (follower 1) relative-accel terms @ epoch 0")
 
+    # Controller Stuff: 
+
+    kp  = 0.1   # [N/km]
+    ki  = 0.0   # [N/(km s)]
+    kd  = 1300.0  # [(N s)/km]
+
+    # Buffers:
+    # after the existing buffers
+    U_hist     = np.zeros((n_steps + 1, dim_u))
+    YREF_hist  = np.zeros((n_steps + 1, dim_y))
+
+    # ─── Pipeline classes ────────────────────────────────────────────
+    sensor     = Sensor()
+    guidance   = Guidance(dim_y, dim_x_sc, radius=0.3, omega_rot_per_day=1.0)
+    ctrl       = Controller(kp, ki, kd, n_sc=n_sc, T_max=param.T_MAX, dim_x_sc=dim_x_sc, dim_u_sc=dim_u_sc,)
+    plant      = Plant(env, param, flags, n_sc, dim_x_sc, dim_u_sc)
+
+    # test_guidance_trajectory(guidance, dim_x_sc=dim_x_sc, dt=dt, t_tot=2*86400)
 
     # ─── Main control loop ───────────────────────────────────────────
 
@@ -170,10 +184,13 @@ def main():
         y_hat   = sensor.measure(x, et)
 
         # ------------  Plan  ----------- #
-        y_ref   = guidance.reference(et)
-        u       = ctrl.compute(y_hat, y_ref, et)
+        y_ref   = guidance.reference(et, dt)
+        u       = ctrl.compute(y_hat, y_ref, et, dt)
 
-        # Quick manual test: fire all + - y thruster on leader at 1 N (clamped to 0.003 N)
+        U_hist[k + 1, :]    = u
+        YREF_hist[k + 1, :] = y_ref
+
+        # Quick manual test: fire all + - y thruster on leader at 1 N (clamped to 0.03 N)
         # u[1] = 1.0    
         # u[2] = 1.0
         # u[6] = 1.0
@@ -192,14 +209,14 @@ def main():
 
         if (k + 1) % print_every == 0 or k == n_steps - 1:
             dr1_m   = np.linalg.norm(x_next[dim_x_sc : dim_x_sc + 3]) * 1e3
-            mprop_L = x_next[13]
+            mprop_F1 = x_next[dim_x_sc*1 + 13]
             print(
                 f"  k={k+1:5d}/{n_steps}  t={(k+1)*dt/3600:6.3f} h   "
                 f"t_step={delta_t:.4f} s   "                             
                 f"|r_L|={np.linalg.norm(x_next[0:3]):.6e} km   "
                 f"|q_L|={np.linalg.norm(x_next[6:10]):.12f}   "
                 f"|δr_1|={dr1_m:.6f} m   "
-                f"m_prop_L={mprop_L:.4f} kg   "
+                f"m_prop_F1={mprop_F1:.4f} kg   "
             )
 
         x   = x_next
@@ -207,6 +224,13 @@ def main():
 
     # ─── Plots ───────────────────────────────────────────────────────
     print("\nGenerating plots ...")
+
+    plot_controller_summary(
+        t_hist, X_hist, U_hist, YREF_hist,
+        dim_x_sc=dim_x_sc, dim_u_sc=dim_u_sc, follower_idx=1,
+        T_max=param.T_MAX, B_F=B_F,
+    )
+
     spacecraft = build_plot_spacecraft(param, n_sc)
     plot_trajectory(
         t_hist     = t_hist,
